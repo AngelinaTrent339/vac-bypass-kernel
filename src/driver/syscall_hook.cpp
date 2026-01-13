@@ -663,35 +663,129 @@ Exit:
 }
 #elif (SYSCALL_HOOK_TYPE == SYSCALL_HOOK_ALT_SYSCALL)
 //
-// Alt Syscall Handler Implementation
-// This is a PatchGuard-safe method that uses the undocumented PsRegisterAltSystemCallHandler
-// to hook syscalls for threads with KTHREAD->Header.AltSyscall bit set.
+// Alt Syscall Handler Implementation for Windows 11
+// 
+// Windows 11 completely reworked the Alt Syscall mechanism from Windows 10.
+// PsRegisterAltSystemCallHandler is NO LONGER used (it writes to PsAltSystemCallHandlers
+// which is never read in Win11).
+//
+// Instead, Windows 11 uses:
+// - PspServiceDescriptorGroupTable: A table with up to 32 slots (0x20 rows)
+// - Each row contains: driver_base, ssn_dispatch_table, reserved
+// - EPROCESS->SyscallProviderDispatchContext.Slot: Index into the table (must be < 20)
+// - KTHREAD->Header.DebugActive: Set bit 0x20 to enable alt syscalls
+//
+// The callback signature for Windows 11 is:
+//   int callback(void* p_nt_function, ULONG ssn, void* args_base, void* p3_home)
 //
 // Pros:
-// - PatchGuard safe (uses legitimate callback mechanism)
-// - Obscure and less detected
-// - Full access to KTRAP_FRAME
+// - PatchGuard safe (not monitored)
+// - HyperGuard safe (unless HVCI is enabled - which prevents writes to PspServiceDescriptorGroupTable)
+// - Can intercept AND modify syscalls (return 0 to skip, modify KTRAP_FRAME directly)
+// - Full access to arguments
 //
 // Cons:
-// - Cannot unregister callback (only ONE per session)
-// - Must manually set AltSyscall bit on target threads
-// - Undocumented (may break in future Windows versions)
+// - HVCI blocks writes to PspServiceDescriptorGroupTable
+// - Undocumented and may break in future Windows versions
+// - Requires pattern scanning to find PspServiceDescriptorGroupTable
+// - Windows 11 only (24H2 tested)
 //
 
-// KTHREAD offsets for AltSyscall bit
-// The AltSyscall bit is in KTHREAD->Header (DISPATCHER_HEADER) at offset 0x02 (Lock byte), bit 4
-// Or directly as Header.AltSyscall at offset 0x02
-#define KTHREAD_HEADER_OFFSET 0x00
-#define KTHREAD_HEADER_ALTSYSCALL_BYTE_OFFSET 0x02
-#define KTHREAD_HEADER_ALTSYSCALL_BIT 0x10  // Bit 4 of the Lock/AltSyscall byte
+// ============================================================================
+// Structures for Windows 11 Alt Syscalls
+// ============================================================================
 
-// Alternative: Some sources indicate it's at offset 0x74 in the header for newer builds
-// We'll use the Header.AltSyscall approach which is at offset 0x02 in DISPATCHER_HEADER
+// The dispatch table entry - contains RVA offsets to callback functions
+// Count is the maximum SSN this table handles
+// Descriptors contain: (RVA << 4) | flags
+//   - flags & 0x10: Use generic dispatch path
+//   - flags & 0x0F: Number of QWORDs to copy from stack
+#define ALT_SYSCALL_SSN_COUNT 0x200  // Maximum SSN count we support
 
-ULONG64 __fastcall AltSyscallHandler(PKTRAP_FRAME TrapFrame)
+#pragma pack(push, 1)
+typedef struct _ALT_SYSCALL_DISPATCH_TABLE
 {
-    // Get the syscall index from RAX
-    const ULONG SyscallIndex = static_cast<ULONG>(TrapFrame->Rax);
+    ULONG64 Count;                              // Number of SSNs we provide for (capacity)
+    ULONG Descriptors[ALT_SYSCALL_SSN_COUNT];   // Array of (RVA << 4) | flags
+} ALT_SYSCALL_DISPATCH_TABLE, *PALT_SYSCALL_DISPATCH_TABLE;
+
+// Each row in PspServiceDescriptorGroupTable
+typedef struct _PSP_SERVICE_DESCRIPTOR_ROW
+{
+    PVOID DriverBase;                           // Base address of the driver
+    PALT_SYSCALL_DISPATCH_TABLE DispatchTable;  // Pointer to our dispatch table
+    PVOID Reserved;                             // Unused
+} PSP_SERVICE_DESCRIPTOR_ROW, *PPSP_SERVICE_DESCRIPTOR_ROW;
+
+// The main table - up to 32 slots
+typedef struct _PSP_SERVICE_DESCRIPTOR_GROUP_TABLE
+{
+    PSP_SERVICE_DESCRIPTOR_ROW Rows[0x20];
+} PSP_SERVICE_DESCRIPTOR_GROUP_TABLE, *PPSP_SERVICE_DESCRIPTOR_GROUP_TABLE;
+
+// EPROCESS->SyscallProviderDispatchContext structure
+typedef struct _PSP_SYSCALL_PROVIDER_DISPATCH_CONTEXT
+{
+    ULONG Level;    // Unknown purpose
+    ULONG Slot;     // Index into PspServiceDescriptorGroupTable (must be < 20)
+} PSP_SYSCALL_PROVIDER_DISPATCH_CONTEXT, *PPSP_SYSCALL_PROVIDER_DISPATCH_CONTEXT;
+#pragma pack(pop)
+
+// ============================================================================
+// Windows 11 Version-Specific Offsets
+// ============================================================================
+
+// Offsets for Windows 11 24H2 (26100)
+// These WILL change between Windows versions!
+constexpr ULONG OFFSET_EPROCESS_SYSCALL_PROVIDER_DISPATCH_CTX = 0x7D0;
+constexpr ULONG OFFSET_KTHREAD_DEBUG_ACTIVE = 0x03;  // DISPATCHER_HEADER.DebugActive
+constexpr ULONG OFFSET_EPROCESS_ACTIVE_PROCESS_LINKS = 0x1D8;
+constexpr ULONG OFFSET_EPROCESS_THREAD_LIST_HEAD = 0x370;
+constexpr ULONG OFFSET_ETHREAD_THREAD_LIST_ENTRY = 0x578;
+
+// Alt syscall enable bit in DebugActive
+constexpr UCHAR ALT_SYSCALL_DEBUG_ACTIVE_BIT = 0x20;
+
+// Slot ID we use (0 is typically safe, but could use 0-19)
+constexpr ULONG ALT_SYSCALL_SLOT_ID = 0;
+
+// Flags for the dispatch table entries
+constexpr ULONG GENERIC_PATH_FLAGS = 0x10;  // Use PspSyscallProviderServiceDispatchGeneric
+constexpr ULONG NUM_STACK_ARGS_TO_COPY = 0x0;  // We get stack args ourselves via p3_home
+
+// ============================================================================
+// Global Variables
+// ============================================================================
+
+inline PPSP_SERVICE_DESCRIPTOR_GROUP_TABLE g_PspServiceDescriptorGroupTable = nullptr;
+inline PALT_SYSCALL_DISPATCH_TABLE g_AltSyscallDispatchTable = nullptr;
+inline PVOID g_DriverBase = nullptr;
+
+// ============================================================================
+// Alt Syscall Callback
+// ============================================================================
+
+/// Windows 11 Alt Syscall callback routine
+/// 
+/// @param pNtFunction   Function pointer to the real Nt* dispatch function
+/// @param Ssn           System Service Number of the syscall
+/// @param ArgsBase      Base address of the first 4 arguments (rcx, rdx, r8, r9 - each 8 bytes)
+/// @param P3Home        Address of P3Home field in KTRAP_FRAME (KTRAP_FRAME is at P3Home - 0x10)
+/// 
+/// @return 1 to continue normal syscall dispatch, 0 to skip syscall (return our own result)
+///
+ULONG64 __fastcall AltSyscallHandler(
+    _In_ PVOID pNtFunction,
+    _In_ ULONG Ssn,
+    _In_ PVOID ArgsBase,
+    _In_ PVOID P3Home)
+{
+    UNREFERENCED_PARAMETER(pNtFunction);
+    
+    if (!ArgsBase || !P3Home)
+    {
+        return 1;  // Continue normal dispatch
+    }
     
     // Increment reference count
     InterlockedIncrement(&Hooks::g_hooksRefCount);
@@ -700,40 +794,99 @@ ULONG64 __fastcall AltSyscallHandler(PKTRAP_FRAME TrapFrame)
         InterlockedDecrement(&Hooks::g_hooksRefCount);
     };
     
+    // Calculate KTRAP_FRAME address from P3Home
+    // P3Home is at offset 0x10 in KTRAP_FRAME
+    PKTRAP_FRAME TrapFrame = reinterpret_cast<PKTRAP_FRAME>(
+        reinterpret_cast<PUCHAR>(P3Home) - 0x10);
+    
+    // Get stack pointer for additional arguments (5th arg onwards)
+    PVOID Rsp = reinterpret_cast<PVOID>(TrapFrame->Rsp);
+    constexpr ULONG ARG5_STACK_OFFSET = 0x28;  // 5th arg is at RSP + 0x28
+    
+    // Extract first 4 arguments from ArgsBase
+    PULONG_PTR Args = reinterpret_cast<PULONG_PTR>(ArgsBase);
+    ULONG_PTR Arg1 = Args[0];  // RCX
+    ULONG_PTR Arg2 = Args[1];  // RDX
+    ULONG_PTR Arg3 = Args[2];  // R8
+    ULONG_PTR Arg4 = Args[3];  // R9
+    
+    UNREFERENCED_PARAMETER(Arg1);
+    UNREFERENCED_PARAMETER(Arg2);
+    UNREFERENCED_PARAMETER(Arg3);
+    UNREFERENCED_PARAMETER(Arg4);
+    UNREFERENCED_PARAMETER(Rsp);
+    UNREFERENCED_PARAMETER(ARG5_STACK_OFFSET);
+    
     // Check if this syscall is one we're interested in
     for (Hooks::SYSCALL_HOOK_ENTRY& Entry : Hooks::g_SyscallHookList)
     {
-        if (Entry.ServiceIndex == SyscallIndex && Entry.ServiceIndex != ULONG_MAX)
+        if (Entry.ServiceIndex == Ssn && Entry.ServiceIndex != ULONG_MAX)
         {
-            // Found a matching hook - call our handler
-            // The handler signature matches Nt* functions, we need to extract arguments from TrapFrame
-            // Windows x64 calling convention: RCX, RDX, R8, R9, then stack
-            //
-            // For Alt Syscall, we can either:
-            // 1. Directly call the hooked function with trap frame args
-            // 2. Modify trap frame to redirect execution
-            //
-            // We'll use approach 1 - call the hook function directly
+            DBG_PRINT("[AltSyscall] Intercepted SSN 0x%X", Ssn);
             
-            typedef NTSTATUS (NTAPI *SYSCALL_FUNC)(ULONG64, ULONG64, ULONG64, ULONG64);
-            
-            // Get original routine to call
-            auto OriginalRoutine = reinterpret_cast<SYSCALL_FUNC>(Entry.OriginalRoutineAddress);
-            auto HookRoutine = reinterpret_cast<NTSTATUS (NTAPI *)(PKTRAP_FRAME)>(Entry.NewRoutineAddress);
-            
-            // For simplicity, we'll just log that we intercepted it
-            // In a real implementation, you'd call your hook function
-            
-            DBG_PRINT("[AltSyscall] Intercepted syscall index %u", SyscallIndex);
+            // TODO: Implement actual hook logic here
+            // You can:
+            // 1. Inspect arguments via ArgsBase
+            // 2. Modify KTRAP_FRAME directly to change arguments
+            // 3. Return 0 to skip the syscall entirely
+            // 4. Modify TrapFrame->P3Home to change the return value (when returning 0)
             
             break;
         }
     }
     
     // Return 1 to continue normal syscall execution
-    // Return 0 would skip the syscall (use with caution)
     return 1;
 }
+
+// ============================================================================
+// Pattern Scanning for PspServiceDescriptorGroupTable
+// ============================================================================
+
+/// Find PspServiceDescriptorGroupTable by pattern scanning
+/// The pattern is found in PsSyscallProviderDispatch
+PVOID FindPspServiceDescriptorGroupTable()
+{
+    // Pattern for finding reference to PspServiceDescriptorGroupTable in PsSyscallProviderDispatch
+    // This will vary between Windows builds!
+    
+    // Search in ntoskrnl for "PsSyscallProviderDispatch" and find LEA instruction
+    // that references PspServiceDescriptorGroupTable
+    
+    // Pattern: 4C 8D 05 ?? ?? ?? ?? (lea r8, [rip+offset])
+    // This is followed by indexing into the table
+    
+    const PUCHAR Pattern = Misc::Memory::FindPattern(
+        NTOS_BASE, 
+        "PAGE",  // Usually in PAGE section
+        "48 8B 05 ?? ?? ?? ?? "  // mov rax, [PspServiceDescriptorGroupTable]
+        "48 6B ?? 18"            // imul reg, reg, 0x18 (size of each row)
+    );
+    
+    if (!Pattern)
+    {
+        // Try alternate pattern
+        const PUCHAR AltPattern = Misc::Memory::FindPattern(
+            NTOS_BASE,
+            ".text",
+            "4C 8D 05 ?? ?? ?? ?? "  // lea r8, [PspServiceDescriptorGroupTable]
+            "49 8B 04 C0"            // mov rax, [r8+rax*8]
+        );
+        
+        if (AltPattern)
+        {
+            return RipToAbsolute<PVOID>(reinterpret_cast<ULONG_PTR>(AltPattern), 3, 7);
+        }
+        
+        return nullptr;
+    }
+    
+    return RipToAbsolute<PVOID>(reinterpret_cast<ULONG_PTR>(Pattern), 3, 7);
+}
+
+// ============================================================================
+// Thread/Process Configuration
+// ============================================================================
 
 NTSTATUS EnableAltSyscallForThread(_In_ PETHREAD Thread)
 {
@@ -742,15 +895,22 @@ NTSTATUS EnableAltSyscallForThread(_In_ PETHREAD Thread)
         return STATUS_INVALID_PARAMETER;
     }
     
-    // Get pointer to the thread's AltSyscall byte
-    // KTHREAD is at the start of ETHREAD
+    // Check if this is a Pico process thread (bit 0x04 in DebugActive)
+    // We don't want to mess with WSL/Pico threads
     PUCHAR ThreadBase = reinterpret_cast<PUCHAR>(Thread);
-    PUCHAR AltSyscallByte = ThreadBase + KTHREAD_HEADER_ALTSYSCALL_BYTE_OFFSET;
+    PUCHAR DebugActiveByte = ThreadBase + OFFSET_KTHREAD_DEBUG_ACTIVE;
     
-    // Set the AltSyscall bit (bit 4)
-    InterlockedOr8(reinterpret_cast<volatile CHAR*>(AltSyscallByte), KTHREAD_HEADER_ALTSYSCALL_BIT);
+    if ((*DebugActiveByte & 0x04) != 0)
+    {
+        // This is a Pico process thread, skip it
+        return STATUS_SUCCESS;
+    }
     
-    DBG_PRINT("[AltSyscall] Enabled for thread 0x%p", Thread);
+    // Set the AltSyscall bit (0x20) in DebugActive
+    InterlockedOr8(reinterpret_cast<volatile CHAR*>(DebugActiveByte), ALT_SYSCALL_DEBUG_ACTIVE_BIT);
+    
+    DBG_PRINT("[AltSyscall] Enabled for thread 0x%p (DebugActive @ 0x%p = 0x%02X)", 
+              Thread, DebugActiveByte, *DebugActiveByte);
     
     return STATUS_SUCCESS;
 }
@@ -762,16 +922,34 @@ NTSTATUS DisableAltSyscallForThread(_In_ PETHREAD Thread)
         return STATUS_INVALID_PARAMETER;
     }
     
-    // Get pointer to the thread's AltSyscall byte
     PUCHAR ThreadBase = reinterpret_cast<PUCHAR>(Thread);
-    PUCHAR AltSyscallByte = ThreadBase + KTHREAD_HEADER_ALTSYSCALL_BYTE_OFFSET;
+    PUCHAR DebugActiveByte = ThreadBase + OFFSET_KTHREAD_DEBUG_ACTIVE;
     
-    // Clear the AltSyscall bit (bit 4)
-    InterlockedAnd8(reinterpret_cast<volatile CHAR*>(AltSyscallByte), ~KTHREAD_HEADER_ALTSYSCALL_BIT);
+    // Clear the AltSyscall bit
+    InterlockedAnd8(reinterpret_cast<volatile CHAR*>(DebugActiveByte), ~ALT_SYSCALL_DEBUG_ACTIVE_BIT);
     
     DBG_PRINT("[AltSyscall] Disabled for thread 0x%p", Thread);
     
     return STATUS_SUCCESS;
+}
+
+/// Configure EPROCESS for alt syscalls by setting the Slot field
+void ConfigureProcessForAltSyscall(_In_ PETHREAD Thread)
+{
+    PEPROCESS Process = IoThreadToProcess(Thread);
+    if (!Process)
+    {
+        return;
+    }
+    
+    PUCHAR ProcessBase = reinterpret_cast<PUCHAR>(Process);
+    PPSP_SYSCALL_PROVIDER_DISPATCH_CONTEXT DispatchCtx = reinterpret_cast<PPSP_SYSCALL_PROVIDER_DISPATCH_CONTEXT>(
+        ProcessBase + OFFSET_EPROCESS_SYSCALL_PROVIDER_DISPATCH_CTX);
+    
+    // Set the slot ID
+    DispatchCtx->Slot = ALT_SYSCALL_SLOT_ID;
+    
+    DBG_PRINT("[AltSyscall] Set process 0x%p slot to %u", Process, ALT_SYSCALL_SLOT_ID);
 }
 
 NTSTATUS EnableAltSyscallForProcess(_In_ PEPROCESS Process)
@@ -781,26 +959,29 @@ NTSTATUS EnableAltSyscallForProcess(_In_ PEPROCESS Process)
         return STATUS_INVALID_PARAMETER;
     }
     
-    NTSTATUS Status = STATUS_SUCCESS;
-    KAPC_STATE ApcState;
+    // Enumerate all threads in the process using the thread list
+    PUCHAR ProcessBase = reinterpret_cast<PUCHAR>(Process);
+    PLIST_ENTRY ThreadListHead = reinterpret_cast<PLIST_ENTRY>(
+        ProcessBase + OFFSET_EPROCESS_THREAD_LIST_HEAD);
     
-    KeStackAttachProcess(Process, &ApcState);
-    
-    // Enumerate all threads in the process
-    PETHREAD Thread = nullptr;
-    while (NT_SUCCESS(PsGetNextProcessThread(Process, &Thread)))
+    if (IsListEmpty(ThreadListHead))
     {
-        NTSTATUS ThreadStatus = EnableAltSyscallForThread(Thread);
-        if (!NT_SUCCESS(ThreadStatus))
-        {
-            WPP_PRINT(TRACE_LEVEL_WARNING, GENERAL, 
-                      "Failed to enable AltSyscall for thread 0x%p: %!STATUS!", Thread, ThreadStatus);
-        }
+        return STATUS_SUCCESS;
     }
     
-    KeUnstackDetachProcess(&ApcState);
+    PLIST_ENTRY Entry = ThreadListHead->Flink;
+    while (Entry != ThreadListHead)
+    {
+        PETHREAD Thread = reinterpret_cast<PETHREAD>(
+            reinterpret_cast<PUCHAR>(Entry) - OFFSET_ETHREAD_THREAD_LIST_ENTRY);
+        
+        EnableAltSyscallForThread(Thread);
+        ConfigureProcessForAltSyscall(Thread);
+        
+        Entry = Entry->Flink;
+    }
     
-    return Status;
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS DisableAltSyscallForProcess(_In_ PEPROCESS Process)
@@ -810,33 +991,79 @@ NTSTATUS DisableAltSyscallForProcess(_In_ PEPROCESS Process)
         return STATUS_INVALID_PARAMETER;
     }
     
-    NTSTATUS Status = STATUS_SUCCESS;
-    KAPC_STATE ApcState;
+    PUCHAR ProcessBase = reinterpret_cast<PUCHAR>(Process);
+    PLIST_ENTRY ThreadListHead = reinterpret_cast<PLIST_ENTRY>(
+        ProcessBase + OFFSET_EPROCESS_THREAD_LIST_HEAD);
     
-    KeStackAttachProcess(Process, &ApcState);
-    
-    // Enumerate all threads in the process
-    PETHREAD Thread = nullptr;
-    while (NT_SUCCESS(PsGetNextProcessThread(Process, &Thread)))
+    if (IsListEmpty(ThreadListHead))
     {
-        NTSTATUS ThreadStatus = DisableAltSyscallForThread(Thread);
-        if (!NT_SUCCESS(ThreadStatus))
-        {
-            WPP_PRINT(TRACE_LEVEL_WARNING, GENERAL, 
-                      "Failed to disable AltSyscall for thread 0x%p: %!STATUS!", Thread, ThreadStatus);
-        }
+        return STATUS_SUCCESS;
     }
     
-    KeUnstackDetachProcess(&ApcState);
+    PLIST_ENTRY Entry = ThreadListHead->Flink;
+    while (Entry != ThreadListHead)
+    {
+        PETHREAD Thread = reinterpret_cast<PETHREAD>(
+            reinterpret_cast<PUCHAR>(Entry) - OFFSET_ETHREAD_THREAD_LIST_ENTRY);
+        
+        DisableAltSyscallForThread(Thread);
+        
+        Entry = Entry->Flink;
+    }
     
-    return Status;
+    return STATUS_SUCCESS;
 }
+
+// ============================================================================
+// Walk all processes and enable Alt Syscalls
+// ============================================================================
+
+void WalkActiveProcessesAndSetBits(bool Enable)
+{
+    PEPROCESS CurrentProcess = IoGetCurrentProcess();
+    if (!CurrentProcess)
+    {
+        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "IoGetCurrentProcess returned NULL");
+        return;
+    }
+    
+    PUCHAR ProcessBase = reinterpret_cast<PUCHAR>(CurrentProcess);
+    PLIST_ENTRY ListHead = reinterpret_cast<PLIST_ENTRY>(
+        ProcessBase + OFFSET_EPROCESS_ACTIVE_PROCESS_LINKS);
+    PLIST_ENTRY Entry = ListHead->Flink;
+    
+    while (Entry != ListHead)
+    {
+        PEPROCESS Process = reinterpret_cast<PEPROCESS>(
+            reinterpret_cast<PUCHAR>(Entry) - OFFSET_EPROCESS_ACTIVE_PROCESS_LINKS);
+        
+        // Skip PID 0 (Idle process)
+        HANDLE Pid = PsGetProcessId(Process);
+        if (Pid == 0)
+        {
+            Entry = Entry->Flink;
+            continue;
+        }
+        
+        if (Enable)
+        {
+            EnableAltSyscallForProcess(Process);
+        }
+        else
+        {
+            DisableAltSyscallForProcess(Process);
+        }
+        
+        Entry = Entry->Flink;
+    }
+}
+
+// ============================================================================
+// Initialization and Cleanup
+// ============================================================================
 
 void CleanupAltSyscallHook()
 {
-    // Note: We CANNOT unregister the Alt Syscall handler once registered
-    // The only cleanup we can do is disable AltSyscall on all tracked threads
-    
     WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL, "AltSyscall Cleanup -- Waiting for pending hooks...");
     
     // Wait for all pending hooks to complete
@@ -845,18 +1072,22 @@ void CleanupAltSyscallHook()
         YieldProcessor();
     }
     
-    // Disable AltSyscall for all game processes
-    Processes::g_ProcessesListLock.LockShared();
+    // Disable AltSyscall bits on all processes
+    WalkActiveProcessesAndSetBits(false);
     
-    Processes::EnumProcessesUnsafe([](Processes::PPROCESS_ENTRY Entry) -> BOOLEAN {
-        if (Entry->Flags.Game && Entry->Process)
-        {
-            DisableAltSyscallForProcess(Entry->Process);
-        }
-        return FALSE; // Continue enumeration
-    });
+    // Clear our row in PspServiceDescriptorGroupTable
+    if (g_PspServiceDescriptorGroupTable)
+    {
+        RtlZeroMemory(&g_PspServiceDescriptorGroupTable->Rows[ALT_SYSCALL_SLOT_ID], 
+                      sizeof(PSP_SERVICE_DESCRIPTOR_ROW));
+    }
     
-    Processes::g_ProcessesListLock.Unlock();
+    // Free our dispatch table
+    if (g_AltSyscallDispatchTable)
+    {
+        Memory::FreePool(g_AltSyscallDispatchTable);
+        g_AltSyscallDispatchTable = nullptr;
+    }
     
     WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL, "AltSyscall Cleanup -- Complete");
 }
@@ -867,46 +1098,107 @@ NTSTATUS InitializeAltSyscallHook()
     
     NTSTATUS Status = STATUS_UNSUCCESSFUL;
     
-    // Get PsRegisterAltSystemCallHandler
-    UNICODE_STRING FuncName;
-    RtlInitUnicodeString(&FuncName, L"PsRegisterAltSystemCallHandler");
-    
-    g_PsRegisterAltSystemCallHandler = reinterpret_cast<Hooks::FN_PsRegisterAltSystemCallHandler>(
-        MmGetSystemRoutineAddress(&FuncName));
-    
-    if (!g_PsRegisterAltSystemCallHandler)
+    // Check Windows version - this only works on Windows 11
+    if (NTOS_BUILD < WINVER_WIN11_21H2)
     {
         WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, 
-                  "PsRegisterAltSystemCallHandler not found! This API may not be available on this Windows version.");
+                  "Alt Syscall (Win11 method) requires Windows 11. Build %u detected.", NTOS_BUILD);
+        return STATUS_NOT_SUPPORTED;
+    }
+    
+    DBG_PRINT("[AltSyscall] Initializing for Windows 11 build %u", NTOS_BUILD);
+    
+    // Get our driver's base address
+    g_DriverBase = Misc::Module::GetDriverBase();
+    if (!g_DriverBase)
+    {
+        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "Failed to get driver base address");
+        return STATUS_UNSUCCESSFUL;
+    }
+    
+    DBG_PRINT("[AltSyscall] Driver base = 0x%p", g_DriverBase);
+    
+    // Find PspServiceDescriptorGroupTable
+    g_PspServiceDescriptorGroupTable = reinterpret_cast<PPSP_SERVICE_DESCRIPTOR_GROUP_TABLE>(
+        FindPspServiceDescriptorGroupTable());
+    
+    if (!g_PspServiceDescriptorGroupTable)
+    {
+        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, 
+                  "Failed to find PspServiceDescriptorGroupTable! Pattern may need updating for this build.");
         return STATUS_PROCEDURE_NOT_FOUND;
     }
     
-    DBG_PRINT("PsRegisterAltSystemCallHandler = 0x%p", g_PsRegisterAltSystemCallHandler);
+    DBG_PRINT("[AltSyscall] PspServiceDescriptorGroupTable = 0x%p", g_PspServiceDescriptorGroupTable);
     
-    // Register our Alt Syscall handler
-    // Index 1 = custom handler (PsAltSystemCallHandlers[1])
-    // Index 0 = PsPicoAltSystemCallDispatch (used by WSL/Pico processes)
-    Status = g_PsRegisterAltSystemCallHandler(&AltSyscallHandler, 1);
+    // Allocate our dispatch table
+    g_AltSyscallDispatchTable = reinterpret_cast<PALT_SYSCALL_DISPATCH_TABLE>(
+        Memory::AllocNonPaged(sizeof(ALT_SYSCALL_DISPATCH_TABLE), Memory::TAG_SYSCALL_HOOK));
     
-    if (!NT_SUCCESS(Status))
+    if (!g_AltSyscallDispatchTable)
+    {
+        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "Failed to allocate dispatch table");
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    
+    RtlZeroMemory(g_AltSyscallDispatchTable, sizeof(ALT_SYSCALL_DISPATCH_TABLE));
+    
+    // Set the count (capacity)
+    g_AltSyscallDispatchTable->Count = ALT_SYSCALL_SSN_COUNT;
+    
+    // Calculate the RVA of our callback from driver base
+    ULONG_PTR CallbackAddress = reinterpret_cast<ULONG_PTR>(&AltSyscallHandler);
+    ULONG_PTR RvaOffset = CallbackAddress - reinterpret_cast<ULONG_PTR>(g_DriverBase);
+    
+    // Safety check - offset must fit in a ULONG
+    if (RvaOffset > MAXULONG)
     {
         WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, 
-                  "PsRegisterAltSystemCallHandler failed with %!STATUS!", Status);
-        
-        // This can fail if:
-        // 1. A handler is already registered (only one allowed per session)
-        // 2. Invalid handler index
-        // 3. System doesn't support this feature
-        
-        return Status;
+                  "Callback RVA offset too large: 0x%llX", RvaOffset);
+        Memory::FreePool(g_AltSyscallDispatchTable);
+        g_AltSyscallDispatchTable = nullptr;
+        return STATUS_INTEGER_OVERFLOW;
     }
+    
+    DBG_PRINT("[AltSyscall] Callback = 0x%p, RVA = 0x%08X", 
+              reinterpret_cast<PVOID>(CallbackAddress), static_cast<ULONG>(RvaOffset));
+    
+    // Fill the descriptor table
+    // Each entry: (RVA << 4) | flags
+    // flags = 0x10 for generic path + number of stack QWORDs to copy
+    ULONG DescriptorValue = (static_cast<ULONG>(RvaOffset) << 4) | (GENERIC_PATH_FLAGS | (NUM_STACK_ARGS_TO_COPY & 0x0F));
+    
+    for (ULONG i = 0; i < ALT_SYSCALL_SSN_COUNT; i++)
+    {
+        g_AltSyscallDispatchTable->Descriptors[i] = DescriptorValue;
+    }
+    
+    // Write our row to PspServiceDescriptorGroupTable
+    // NOTE: This will fail if HVCI is enabled!
+    __try
+    {
+        g_PspServiceDescriptorGroupTable->Rows[ALT_SYSCALL_SLOT_ID].DriverBase = g_DriverBase;
+        g_PspServiceDescriptorGroupTable->Rows[ALT_SYSCALL_SLOT_ID].DispatchTable = g_AltSyscallDispatchTable;
+        g_PspServiceDescriptorGroupTable->Rows[ALT_SYSCALL_SLOT_ID].Reserved = nullptr;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, 
+                  "Exception writing to PspServiceDescriptorGroupTable - HVCI may be blocking writes!");
+        Memory::FreePool(g_AltSyscallDispatchTable);
+        g_AltSyscallDispatchTable = nullptr;
+        return STATUS_ACCESS_VIOLATION;
+    }
+    
+    DBG_PRINT("[AltSyscall] Installed dispatch table at slot %u", ALT_SYSCALL_SLOT_ID);
+    
+    // Enable alt syscalls for all running processes
+    WalkActiveProcessesAndSetBits(true);
     
     g_AltSyscallRegistered = true;
     
     WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, 
-              "Successfully registered Alt Syscall handler (PG-safe syscall hooking)");
-    
-    DBG_PRINT("[AltSyscall] Handler registered successfully");
+              "Successfully initialized Windows 11 Alt Syscall hooks (PG-safe)");
     
     return STATUS_SUCCESS;
 }

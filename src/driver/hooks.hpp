@@ -49,14 +49,6 @@ typedef struct _SYSCALL_HOOK_ENTRY
 #endif
 } SYSCALL_HOOK_ENTRY, *PSYSCALL_HOOK_ENTRY;
 
-#if (SYSCALL_HOOK_TYPE == SYSCALL_HOOK_ALT_SYSCALL)
-// Alt Syscall Handler - PG safe syscall hooking using PsRegisterAltSystemCallHandler
-// This is an undocumented but exported function that allows registering a callback
-// for threads with KTHREAD->Header.AltSyscall bit set.
-typedef ULONG64 (*ALT_SYSCALL_HANDLER)(PKTRAP_FRAME TrapFrame);
-typedef NTSTATUS (*FN_PsRegisterAltSystemCallHandler)(ALT_SYSCALL_HANDLER Handler, ULONG HandlerIndex);
-#endif
-
 extern NTSTATUS NTAPI hkNtQuerySystemInformation(IN SYSTEM_INFORMATION_CLASS SystemInformationClass,
                                                  OUT PVOID SystemInformation, IN ULONG SystemInformationLength,
                                                  OUT PULONG ReturnLength OPTIONAL);

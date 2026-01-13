@@ -39,6 +39,7 @@ PLDR_DATA_TABLE_ENTRY32 GetModuleByNameWow64(_In_ PWCHAR moduleName);
 PLDR_DATA_TABLE_ENTRY GetModuleByName(_In_ PWCHAR moduleName);
 PVOID GetSystemModuleBase(_In_ LPCSTR moduleName, _Out_opt_ PULONG moduleSize = nullptr);
 PVOID GetNtoskrnlBase(_Out_opt_ PULONG moduleSize = nullptr);
+PVOID GetDriverBase(_Out_opt_ PULONG moduleSize = nullptr);
 } // namespace Module
 
 namespace PE

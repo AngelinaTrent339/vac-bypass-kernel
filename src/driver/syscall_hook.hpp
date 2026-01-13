@@ -47,14 +47,27 @@ SyscallHookHandler(VOID);
 #elif (SYSCALL_HOOK_TYPE == SYSCALL_HOOK_SSDT_HOOK)
 [[nodiscard]] NTSTATUS Initialize();
 #elif (SYSCALL_HOOK_TYPE == SYSCALL_HOOK_ALT_SYSCALL)
-// Alt Syscall Handler - PatchGuard safe method
-// Uses undocumented PsRegisterAltSystemCallHandler to register a callback
-// Threads with KTHREAD->Header.AltSyscall = 1 will have their syscalls routed through our handler
+// ============================================================================
+// Alt Syscall Handler - Windows 11 PatchGuard-Safe Method
+// ============================================================================
+//
+// Windows 11 uses a completely different mechanism than Windows 10:
+// - PsRegisterAltSystemCallHandler is NOT used (writes to array that's never read)
+// - Instead, we write to PspServiceDescriptorGroupTable directly
+// - Set KTHREAD->Header.DebugActive |= 0x20 to enable per-thread
+// - Set EPROCESS->SyscallProviderDispatchContext.Slot to select our table row
+//
+// Callback receives: (void* p_nt_function, ULONG ssn, void* args_base, void* p3_home)
+//
+// Limitations:
+// - HVCI prevents writes to PspServiceDescriptorGroupTable
+// - Windows 11 only (tested on 24H2)
+// - Undocumented, may break in future versions
+//
 
-inline Hooks::FN_PsRegisterAltSystemCallHandler g_PsRegisterAltSystemCallHandler = nullptr;
 inline bool g_AltSyscallRegistered = false;
 
-// Enables Alt Syscall for a specific thread
+// Enables Alt Syscall for a specific thread (sets DebugActive bit 0x20)
 NTSTATUS EnableAltSyscallForThread(_In_ PETHREAD Thread);
 
 // Disables Alt Syscall for a specific thread

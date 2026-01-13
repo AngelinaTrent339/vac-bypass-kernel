@@ -32,6 +32,7 @@
 UNICODE_STRING g_deviceName = RTL_CONSTANT_STRING(DRIVER_DEVICE_NAME);
 UNICODE_STRING g_symbolicLinkName = RTL_CONSTANT_STRING(DRIVER_SYMBOLIC_NAME);
 PDEVICE_OBJECT g_deviceObject = nullptr;
+PDRIVER_OBJECT g_DriverObject = nullptr;  // Global driver object for GetDriverBase()
 
 #if 0
 extern "C" int abs(int v)
@@ -128,6 +129,9 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     UNREFERENCED_PARAMETER(RegistryPath);
 
     NTSTATUS status;
+
+    // Store driver object globally for GetDriverBase()
+    g_DriverObject = DriverObject;
 
     WPP_INIT_TRACING(DriverObject, RegistryPath);
 
