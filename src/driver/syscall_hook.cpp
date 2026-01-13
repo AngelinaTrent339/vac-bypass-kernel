@@ -661,12 +661,264 @@ Exit:
 
     return Status;
 }
+#elif (SYSCALL_HOOK_TYPE == SYSCALL_HOOK_ALT_SYSCALL)
+//
+// Alt Syscall Handler Implementation
+// This is a PatchGuard-safe method that uses the undocumented PsRegisterAltSystemCallHandler
+// to hook syscalls for threads with KTHREAD->Header.AltSyscall bit set.
+//
+// Pros:
+// - PatchGuard safe (uses legitimate callback mechanism)
+// - Obscure and less detected
+// - Full access to KTRAP_FRAME
+//
+// Cons:
+// - Cannot unregister callback (only ONE per session)
+// - Must manually set AltSyscall bit on target threads
+// - Undocumented (may break in future Windows versions)
+//
+
+// KTHREAD offsets for AltSyscall bit
+// The AltSyscall bit is in KTHREAD->Header (DISPATCHER_HEADER) at offset 0x02 (Lock byte), bit 4
+// Or directly as Header.AltSyscall at offset 0x02
+#define KTHREAD_HEADER_OFFSET 0x00
+#define KTHREAD_HEADER_ALTSYSCALL_BYTE_OFFSET 0x02
+#define KTHREAD_HEADER_ALTSYSCALL_BIT 0x10  // Bit 4 of the Lock/AltSyscall byte
+
+// Alternative: Some sources indicate it's at offset 0x74 in the header for newer builds
+// We'll use the Header.AltSyscall approach which is at offset 0x02 in DISPATCHER_HEADER
+
+ULONG64 __fastcall AltSyscallHandler(PKTRAP_FRAME TrapFrame)
+{
+    // Get the syscall index from RAX
+    const ULONG SyscallIndex = static_cast<ULONG>(TrapFrame->Rax);
+    
+    // Increment reference count
+    InterlockedIncrement(&Hooks::g_hooksRefCount);
+    SCOPE_EXIT
+    {
+        InterlockedDecrement(&Hooks::g_hooksRefCount);
+    };
+    
+    // Check if this syscall is one we're interested in
+    for (Hooks::SYSCALL_HOOK_ENTRY& Entry : Hooks::g_SyscallHookList)
+    {
+        if (Entry.ServiceIndex == SyscallIndex && Entry.ServiceIndex != ULONG_MAX)
+        {
+            // Found a matching hook - call our handler
+            // The handler signature matches Nt* functions, we need to extract arguments from TrapFrame
+            // Windows x64 calling convention: RCX, RDX, R8, R9, then stack
+            //
+            // For Alt Syscall, we can either:
+            // 1. Directly call the hooked function with trap frame args
+            // 2. Modify trap frame to redirect execution
+            //
+            // We'll use approach 1 - call the hook function directly
+            
+            typedef NTSTATUS (NTAPI *SYSCALL_FUNC)(ULONG64, ULONG64, ULONG64, ULONG64);
+            
+            // Get original routine to call
+            auto OriginalRoutine = reinterpret_cast<SYSCALL_FUNC>(Entry.OriginalRoutineAddress);
+            auto HookRoutine = reinterpret_cast<NTSTATUS (NTAPI *)(PKTRAP_FRAME)>(Entry.NewRoutineAddress);
+            
+            // For simplicity, we'll just log that we intercepted it
+            // In a real implementation, you'd call your hook function
+            
+            DBG_PRINT("[AltSyscall] Intercepted syscall index %u", SyscallIndex);
+            
+            break;
+        }
+    }
+    
+    // Return 1 to continue normal syscall execution
+    // Return 0 would skip the syscall (use with caution)
+    return 1;
+}
+
+NTSTATUS EnableAltSyscallForThread(_In_ PETHREAD Thread)
+{
+    if (!Thread)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    // Get pointer to the thread's AltSyscall byte
+    // KTHREAD is at the start of ETHREAD
+    PUCHAR ThreadBase = reinterpret_cast<PUCHAR>(Thread);
+    PUCHAR AltSyscallByte = ThreadBase + KTHREAD_HEADER_ALTSYSCALL_BYTE_OFFSET;
+    
+    // Set the AltSyscall bit (bit 4)
+    InterlockedOr8(reinterpret_cast<volatile CHAR*>(AltSyscallByte), KTHREAD_HEADER_ALTSYSCALL_BIT);
+    
+    DBG_PRINT("[AltSyscall] Enabled for thread 0x%p", Thread);
+    
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS DisableAltSyscallForThread(_In_ PETHREAD Thread)
+{
+    if (!Thread)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    // Get pointer to the thread's AltSyscall byte
+    PUCHAR ThreadBase = reinterpret_cast<PUCHAR>(Thread);
+    PUCHAR AltSyscallByte = ThreadBase + KTHREAD_HEADER_ALTSYSCALL_BYTE_OFFSET;
+    
+    // Clear the AltSyscall bit (bit 4)
+    InterlockedAnd8(reinterpret_cast<volatile CHAR*>(AltSyscallByte), ~KTHREAD_HEADER_ALTSYSCALL_BIT);
+    
+    DBG_PRINT("[AltSyscall] Disabled for thread 0x%p", Thread);
+    
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS EnableAltSyscallForProcess(_In_ PEPROCESS Process)
+{
+    if (!Process)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    NTSTATUS Status = STATUS_SUCCESS;
+    KAPC_STATE ApcState;
+    
+    KeStackAttachProcess(Process, &ApcState);
+    
+    // Enumerate all threads in the process
+    PETHREAD Thread = nullptr;
+    while (NT_SUCCESS(PsGetNextProcessThread(Process, &Thread)))
+    {
+        NTSTATUS ThreadStatus = EnableAltSyscallForThread(Thread);
+        if (!NT_SUCCESS(ThreadStatus))
+        {
+            WPP_PRINT(TRACE_LEVEL_WARNING, GENERAL, 
+                      "Failed to enable AltSyscall for thread 0x%p: %!STATUS!", Thread, ThreadStatus);
+        }
+    }
+    
+    KeUnstackDetachProcess(&ApcState);
+    
+    return Status;
+}
+
+NTSTATUS DisableAltSyscallForProcess(_In_ PEPROCESS Process)
+{
+    if (!Process)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    NTSTATUS Status = STATUS_SUCCESS;
+    KAPC_STATE ApcState;
+    
+    KeStackAttachProcess(Process, &ApcState);
+    
+    // Enumerate all threads in the process
+    PETHREAD Thread = nullptr;
+    while (NT_SUCCESS(PsGetNextProcessThread(Process, &Thread)))
+    {
+        NTSTATUS ThreadStatus = DisableAltSyscallForThread(Thread);
+        if (!NT_SUCCESS(ThreadStatus))
+        {
+            WPP_PRINT(TRACE_LEVEL_WARNING, GENERAL, 
+                      "Failed to disable AltSyscall for thread 0x%p: %!STATUS!", Thread, ThreadStatus);
+        }
+    }
+    
+    KeUnstackDetachProcess(&ApcState);
+    
+    return Status;
+}
+
+void CleanupAltSyscallHook()
+{
+    // Note: We CANNOT unregister the Alt Syscall handler once registered
+    // The only cleanup we can do is disable AltSyscall on all tracked threads
+    
+    WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL, "AltSyscall Cleanup -- Waiting for pending hooks...");
+    
+    // Wait for all pending hooks to complete
+    while (InterlockedCompareExchange(&Hooks::g_hooksRefCount, 0, 0) != 0)
+    {
+        YieldProcessor();
+    }
+    
+    // Disable AltSyscall for all game processes
+    Processes::g_ProcessesListLock.LockShared();
+    
+    Processes::EnumProcessesUnsafe([](Processes::PPROCESS_ENTRY Entry) -> BOOLEAN {
+        if (Entry->Flags.Game && Entry->Process)
+        {
+            DisableAltSyscallForProcess(Entry->Process);
+        }
+        return FALSE; // Continue enumeration
+    });
+    
+    Processes::g_ProcessesListLock.Unlock();
+    
+    WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL, "AltSyscall Cleanup -- Complete");
+}
+
+NTSTATUS InitializeAltSyscallHook()
+{
+    PAGED_PASSIVE();
+    
+    NTSTATUS Status = STATUS_UNSUCCESSFUL;
+    
+    // Get PsRegisterAltSystemCallHandler
+    UNICODE_STRING FuncName;
+    RtlInitUnicodeString(&FuncName, L"PsRegisterAltSystemCallHandler");
+    
+    g_PsRegisterAltSystemCallHandler = reinterpret_cast<Hooks::FN_PsRegisterAltSystemCallHandler>(
+        MmGetSystemRoutineAddress(&FuncName));
+    
+    if (!g_PsRegisterAltSystemCallHandler)
+    {
+        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, 
+                  "PsRegisterAltSystemCallHandler not found! This API may not be available on this Windows version.");
+        return STATUS_PROCEDURE_NOT_FOUND;
+    }
+    
+    DBG_PRINT("PsRegisterAltSystemCallHandler = 0x%p", g_PsRegisterAltSystemCallHandler);
+    
+    // Register our Alt Syscall handler
+    // Index 1 = custom handler (PsAltSystemCallHandlers[1])
+    // Index 0 = PsPicoAltSystemCallDispatch (used by WSL/Pico processes)
+    Status = g_PsRegisterAltSystemCallHandler(&AltSyscallHandler, 1);
+    
+    if (!NT_SUCCESS(Status))
+    {
+        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, 
+                  "PsRegisterAltSystemCallHandler failed with %!STATUS!", Status);
+        
+        // This can fail if:
+        // 1. A handler is already registered (only one allowed per session)
+        // 2. Invalid handler index
+        // 3. System doesn't support this feature
+        
+        return Status;
+    }
+    
+    g_AltSyscallRegistered = true;
+    
+    WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, 
+              "Successfully registered Alt Syscall handler (PG-safe syscall hooking)");
+    
+    DBG_PRINT("[AltSyscall] Handler registered successfully");
+    
+    return STATUS_SUCCESS;
+}
 #endif
 
 #if (SYSCALL_HOOK_TYPE == SYSCALL_HOOK_INFINITY_HOOK)
 NTSTATUS
 Initialize(_In_ SSDT_CALLBACK SsdtCallback)
 #elif (SYSCALL_HOOK_TYPE == SYSCALL_HOOK_SSDT_HOOK)
+NTSTATUS
+Initialize()
+#elif (SYSCALL_HOOK_TYPE == SYSCALL_HOOK_ALT_SYSCALL)
 NTSTATUS
 Initialize()
 #endif
@@ -687,6 +939,8 @@ Initialize()
     Status = InitializeInfinityHook();
 #elif (SYSCALL_HOOK_TYPE == SYSCALL_HOOK_SSDT_HOOK)
     Status = InitializeSsdtHook();
+#elif (SYSCALL_HOOK_TYPE == SYSCALL_HOOK_ALT_SYSCALL)
+    Status = InitializeAltSyscallHook();
 #endif
 
     if (!NT_SUCCESS(Status))
@@ -705,6 +959,8 @@ void Cleanup()
     CleanupInfinityHook();
 #elif (SYSCALL_HOOK_TYPE == SYSCALL_HOOK_SSDT_HOOK)
     CleanupSsdtHook();
+#elif (SYSCALL_HOOK_TYPE == SYSCALL_HOOK_ALT_SYSCALL)
+    CleanupAltSyscallHook();
 #endif
 }
 

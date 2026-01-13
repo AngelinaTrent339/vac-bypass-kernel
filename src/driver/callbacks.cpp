@@ -28,10 +28,17 @@ namespace Callbacks
 void ProcessCallback(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId,
                      _Inout_opt_ PPS_CREATE_NOTIFY_INFO CreateNotifyInfo);
 
+#if (SYSCALL_HOOK_TYPE == SYSCALL_HOOK_ALT_SYSCALL)
+void ThreadCallback(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId, _In_ BOOLEAN Create);
+#endif
+
 bool g_initialized = false;
 
 void Cleanup()
 {
+#if (SYSCALL_HOOK_TYPE == SYSCALL_HOOK_ALT_SYSCALL)
+    PsRemoveCreateThreadNotifyRoutine(&ThreadCallback);
+#endif
     PsSetCreateProcessNotifyRoutineEx(&ProcessCallback, TRUE);
 }
 
@@ -52,6 +59,16 @@ NTSTATUS Initialize()
         WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "PsSetCreateProcessNotifyRoutineEx returned %!STATUS!", status);
         goto Exit;
     }
+
+#if (SYSCALL_HOOK_TYPE == SYSCALL_HOOK_ALT_SYSCALL)
+    // Register thread creation callback to enable AltSyscall on new threads in game process
+    status = PsSetCreateThreadNotifyRoutine(&ThreadCallback);
+    if (!NT_SUCCESS(status))
+    {
+        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "PsSetCreateThreadNotifyRoutine returned %!STATUS!", status);
+        goto Exit;
+    }
+#endif
 
     g_initialized = true;
 
@@ -137,6 +154,24 @@ void ProcessCallback(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId,
             {
                 WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "AddProcessGame returned %!STATUS!", status);
             }
+
+#if (SYSCALL_HOOK_TYPE == SYSCALL_HOOK_ALT_SYSCALL)
+            // Enable Alt Syscall for the game process
+            if (SyscallHook::g_AltSyscallRegistered)
+            {
+                status = SyscallHook::EnableAltSyscallForProcess(Process);
+                if (!NT_SUCCESS(status))
+                {
+                    WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, 
+                              "EnableAltSyscallForProcess returned %!STATUS!", status);
+                }
+                else
+                {
+                    WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, 
+                              "Alt Syscall enabled for game process %d", HandleToULong(ProcessId));
+                }
+            }
+#endif
         }
     }
     else
@@ -163,4 +198,51 @@ void ProcessCallback(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId,
         }
     }
 }
+
+#if (SYSCALL_HOOK_TYPE == SYSCALL_HOOK_ALT_SYSCALL)
+void ThreadCallback(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId, _In_ BOOLEAN Create)
+{
+    UNREFERENCED_PARAMETER(ThreadId);
+    
+    // Only handle thread creation in game processes
+    if (!Create || !Processes::IsProcessGame(ProcessId))
+    {
+        return;
+    }
+    
+    // Skip if Alt Syscall handler is not registered
+    if (!SyscallHook::g_AltSyscallRegistered)
+    {
+        return;
+    }
+    
+    // Get the thread object
+    PETHREAD Thread = nullptr;
+    NTSTATUS status = PsLookupThreadByThreadId(ThreadId, &Thread);
+    if (!NT_SUCCESS(status))
+    {
+        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, 
+                  "PsLookupThreadByThreadId failed for tid %d: %!STATUS!", 
+                  HandleToULong(ThreadId), status);
+        return;
+    }
+    
+    // Enable Alt Syscall for this new thread
+    status = SyscallHook::EnableAltSyscallForThread(Thread);
+    if (!NT_SUCCESS(status))
+    {
+        WPP_PRINT(TRACE_LEVEL_WARNING, GENERAL, 
+                  "Failed to enable AltSyscall for new thread %d: %!STATUS!", 
+                  HandleToULong(ThreadId), status);
+    }
+    else
+    {
+        DBG_PRINT("[AltSyscall] Enabled for new thread %d in game process %d", 
+                  HandleToULong(ThreadId), HandleToULong(ProcessId));
+    }
+    
+    ObDereferenceObject(Thread);
+}
+#endif
+
 } // namespace Callbacks

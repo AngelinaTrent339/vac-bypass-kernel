@@ -46,6 +46,27 @@ SyscallHookHandler(VOID);
 [[nodiscard]] NTSTATUS Initialize(_In_ SSDT_CALLBACK SsdtCallback = Hooks::SsdtCallback);
 #elif (SYSCALL_HOOK_TYPE == SYSCALL_HOOK_SSDT_HOOK)
 [[nodiscard]] NTSTATUS Initialize();
+#elif (SYSCALL_HOOK_TYPE == SYSCALL_HOOK_ALT_SYSCALL)
+// Alt Syscall Handler - PatchGuard safe method
+// Uses undocumented PsRegisterAltSystemCallHandler to register a callback
+// Threads with KTHREAD->Header.AltSyscall = 1 will have their syscalls routed through our handler
+
+inline Hooks::FN_PsRegisterAltSystemCallHandler g_PsRegisterAltSystemCallHandler = nullptr;
+inline bool g_AltSyscallRegistered = false;
+
+// Enables Alt Syscall for a specific thread
+NTSTATUS EnableAltSyscallForThread(_In_ PETHREAD Thread);
+
+// Disables Alt Syscall for a specific thread
+NTSTATUS DisableAltSyscallForThread(_In_ PETHREAD Thread);
+
+// Enables Alt Syscall for all threads in a process
+NTSTATUS EnableAltSyscallForProcess(_In_ PEPROCESS Process);
+
+// Disables Alt Syscall for all threads in a process
+NTSTATUS DisableAltSyscallForProcess(_In_ PEPROCESS Process);
+
+[[nodiscard]] NTSTATUS Initialize();
 #endif
 
 void Unitialize();
