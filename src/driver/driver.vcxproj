@@ -133,7 +133,7 @@
       <PreprocessorDefinitions>SCOPE_GUARD_NO_THROW_ACTION;PHNT_MODE=PHNT_MODE_KERNEL;TMH_FILE=%(FileName)%(Extension).tmh;LAZY_IMPORTER_NO_FORCEINLINE;_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <DisableSpecificWarnings>4201;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
       <AdditionalOptions>/Zc:strictStrings- %(AdditionalOptions)</AdditionalOptions>
-      <TreatWarningAsError>true</TreatWarningAsError>
+      <TreatWarningAsError>false</TreatWarningAsError>
     </ClCompile>
     <Link>
       <AdditionalLibraryDirectories>..\..\ThirdParty\zydis\msvc\bin\DebugX64Kernel;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>

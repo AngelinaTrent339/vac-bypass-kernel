@@ -42,6 +42,130 @@ namespace Hooks
 volatile LONG g_hooksRefCount = 0;
 bool g_shouldBypass = true;
 
+//=============================================================================
+// Fake Hook Bytes Tracking - Store what Roblox THINKS it wrote to system DLLs
+//=============================================================================
+#define MAX_FAKE_WRITES 64
+#define MAX_FAKE_WRITE_SIZE 64
+
+typedef struct _FAKE_WRITE_ENTRY
+{
+    HANDLE ProcessId;
+    PVOID Address;
+    SIZE_T Size;
+    UCHAR FakeBytes[MAX_FAKE_WRITE_SIZE];  // What Roblox tried to write
+    BOOLEAN InUse;
+} FAKE_WRITE_ENTRY, *PFAKE_WRITE_ENTRY;
+
+FAKE_WRITE_ENTRY g_FakeWrites[MAX_FAKE_WRITES] = {0};
+KSPIN_LOCK g_FakeWritesLock;
+BOOLEAN g_FakeWritesInitialized = FALSE;
+
+void InitFakeWrites()
+{
+    if (!g_FakeWritesInitialized)
+    {
+        KeInitializeSpinLock(&g_FakeWritesLock);
+        RtlZeroMemory(g_FakeWrites, sizeof(g_FakeWrites));
+        g_FakeWritesInitialized = TRUE;
+    }
+}
+
+BOOLEAN AddFakeWrite(_In_ HANDLE ProcessId, _In_ PVOID Address, _In_ PVOID Buffer, _In_ SIZE_T Size)
+{
+    if (Size > MAX_FAKE_WRITE_SIZE)
+        Size = MAX_FAKE_WRITE_SIZE;
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_FakeWritesLock, &oldIrql);
+
+    // Check if entry already exists
+    for (ULONG i = 0; i < MAX_FAKE_WRITES; i++)
+    {
+        if (g_FakeWrites[i].InUse && g_FakeWrites[i].ProcessId == ProcessId &&
+            g_FakeWrites[i].Address == Address)
+        {
+            // Update existing entry
+            __try
+            {
+                ProbeForRead(Buffer, Size, 1);
+                RtlCopyMemory(g_FakeWrites[i].FakeBytes, Buffer, Size);
+                g_FakeWrites[i].Size = Size;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
+            KeReleaseSpinLock(&g_FakeWritesLock, oldIrql);
+            return TRUE;
+        }
+    }
+
+    // Find free slot
+    for (ULONG i = 0; i < MAX_FAKE_WRITES; i++)
+    {
+        if (!g_FakeWrites[i].InUse)
+        {
+            g_FakeWrites[i].ProcessId = ProcessId;
+            g_FakeWrites[i].Address = Address;
+            __try
+            {
+                ProbeForRead(Buffer, Size, 1);
+                RtlCopyMemory(g_FakeWrites[i].FakeBytes, Buffer, Size);
+                g_FakeWrites[i].Size = Size;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                KeReleaseSpinLock(&g_FakeWritesLock, oldIrql);
+                return FALSE;
+            }
+            g_FakeWrites[i].InUse = TRUE;
+            KeReleaseSpinLock(&g_FakeWritesLock, oldIrql);
+            return TRUE;
+        }
+    }
+
+    KeReleaseSpinLock(&g_FakeWritesLock, oldIrql);
+    return FALSE;
+}
+
+PFAKE_WRITE_ENTRY FindFakeWrite(_In_ HANDLE ProcessId, _In_ PVOID Address, _In_ SIZE_T Size)
+{
+    ULONG_PTR ReadStart = (ULONG_PTR)Address;
+    ULONG_PTR ReadEnd = ReadStart + Size;
+
+    for (ULONG i = 0; i < MAX_FAKE_WRITES; i++)
+    {
+        if (g_FakeWrites[i].InUse && g_FakeWrites[i].ProcessId == ProcessId)
+        {
+            ULONG_PTR FakeStart = (ULONG_PTR)g_FakeWrites[i].Address;
+            ULONG_PTR FakeEnd = FakeStart + g_FakeWrites[i].Size;
+
+            // Check for overlap
+            if (ReadStart < FakeEnd && ReadEnd > FakeStart)
+            {
+                return &g_FakeWrites[i];
+            }
+        }
+    }
+    return nullptr;
+}
+
+void RemoveFakeWritesForProcess(_In_ HANDLE ProcessId)
+{
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_FakeWritesLock, &oldIrql);
+
+    for (ULONG i = 0; i < MAX_FAKE_WRITES; i++)
+    {
+        if (g_FakeWrites[i].InUse && g_FakeWrites[i].ProcessId == ProcessId)
+        {
+            g_FakeWrites[i].InUse = FALSE;
+        }
+    }
+
+    KeReleaseSpinLock(&g_FakeWritesLock, oldIrql);
+}
+
 decltype(&ZwQuerySystemInformation) oNtQuerySystemInformation = nullptr;
 decltype(&NtReadVirtualMemory) oNtReadVirtualMemory = nullptr;
 decltype(&NtQueryVirtualMemory) oNtQueryVirtualMemory = nullptr;
@@ -273,6 +397,56 @@ NTSTATUS NTAPI hkNtReadVirtualMemory(HANDLE ProcessHandle, PVOID BaseAddress, PV
 
     const HANDLE currentPid = PsGetCurrentProcessId();
     const HANDLE targetPid = Misc::GetProcessIDFromProcessHandle(ProcessHandle);
+
+    //=============================================================================
+    // Roblox reading its own memory to verify hooks - return fake bytes
+    //=============================================================================
+    if (GetPreviousMode() == UserMode && Processes::IsProcessGame(currentPid) &&
+        (targetPid == currentPid || ProcessHandle == NtCurrentProcess()))
+    {
+        // Check if this read overlaps with any fake write we recorded
+        PFAKE_WRITE_ENTRY fakeEntry = FindFakeWrite(currentPid, BaseAddress, NumberOfBytesToRead);
+        if (fakeEntry)
+        {
+            // Call original to get real memory first
+            NTSTATUS status = oNtReadVirtualMemory(ProcessHandle, BaseAddress, Buffer, NumberOfBytesToRead, NumberOfBytesReaded);
+            
+            if (NT_SUCCESS(status))
+            {
+                // Now overlay the fake bytes
+                __try
+                {
+                    ProbeForWrite(Buffer, NumberOfBytesToRead, 1);
+                    
+                    ULONG_PTR ReadStart = (ULONG_PTR)BaseAddress;
+                    ULONG_PTR FakeStart = (ULONG_PTR)fakeEntry->Address;
+                    ULONG_PTR FakeEnd = FakeStart + fakeEntry->Size;
+                    
+                    // Calculate overlap
+                    ULONG_PTR OverlapStart = max(ReadStart, FakeStart);
+                    ULONG_PTR OverlapEnd = min(ReadStart + NumberOfBytesToRead, FakeEnd);
+                    
+                    if (OverlapEnd > OverlapStart)
+                    {
+                        SIZE_T OverlapSize = OverlapEnd - OverlapStart;
+                        SIZE_T BufferOffset = OverlapStart - ReadStart;
+                        SIZE_T FakeOffset = OverlapStart - FakeStart;
+                        
+                        RtlCopyMemory((PUCHAR)Buffer + BufferOffset, 
+                                      fakeEntry->FakeBytes + FakeOffset, 
+                                      OverlapSize);
+                        
+                        DBG_PRINT("[AntiHook] Spoofed read at 0x%p, returning fake hook bytes", BaseAddress);
+                    }
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER)
+                {
+                }
+            }
+            
+            return status;
+        }
+    }
 
     // Check if bypass is enabled and if requestor process is Steam and requested process is game
     //
@@ -1038,6 +1212,9 @@ NTSTATUS NTAPI hkNtWriteVirtualMemory(_In_ HANDLE ProcessHandle, _In_opt_ PVOID 
             DBG_PRINT("[AntiHook] BLOCKED WriteVirtualMemory to system DLL @ 0x%p size 0x%llX", BaseAddress,
                       NumberOfBytesToWrite);
 
+            // Store the fake bytes so we can return them when Roblox reads to verify
+            AddFakeWrite(currentPid, BaseAddress, Buffer, NumberOfBytesToWrite);
+
             // LIE - Say we wrote it, but we didn't
             __try
             {
@@ -1082,6 +1259,9 @@ BOOLEAN CreateHook(const FNV1A_t ServiceNameHash, PVOID *OriginalRoutine)
 NTSTATUS Initialize()
 {
     NTSTATUS Status = STATUS_UNSUCCESSFUL;
+
+    // Initialize fake writes tracking for hook spoofing
+    InitFakeWrites();
 
 #define CREATE_HOOK(name)                                                                                              \
     if (!CreateHook(FNV(#name), reinterpret_cast<VOID **>(&o##name)))                                                  \
