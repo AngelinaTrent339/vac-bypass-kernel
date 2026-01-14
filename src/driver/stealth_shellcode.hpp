@@ -81,7 +81,7 @@ static_assert(sizeof(HIJACK_CONTEXT) == 0x178, "HIJACK_CONTEXT size mismatch wit
 // Defined in stealth_shellcode.obj (assembled from stealth_shellcode.asm)
 //------------------------------------------------------------------------------
 extern "C" void HijackShellcodeV2(PHIJACK_CONTEXT Context);
-extern "C" void HijackShellcodeV2End();
+extern "C" UCHAR HijackShellcodeV2End;  // Label, not function - marks end of shellcode
 
 // Calculate shellcode size at runtime from the linker symbols
 inline SIZE_T GetShellcodeSize()
