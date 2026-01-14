@@ -68,11 +68,16 @@ extern NTSTATUS NTAPI hkNtMapViewOfSection(_In_ HANDLE SectionHandle, _In_ HANDL
                                            _In_ SECTION_INHERIT InheritDisposition, _In_ ULONG AllocationType,
                                            _In_ ULONG Win32Protect);
 
+extern NTSTATUS NTAPI hkNtQueryLicenseValue(_In_ PUNICODE_STRING ValueName, _Out_opt_ PULONG Type,
+                                            _Out_writes_bytes_to_opt_(DataSize, *ResultDataSize) PVOID Data,
+                                            _In_ ULONG DataSize, _Out_ PULONG ResultDataSize);
+
 inline SYSCALL_HOOK_ENTRY g_SyscallHookList[] = {
     {FNV("NtMapViewOfSection"), ULONG_MAX, nullptr, &hkNtMapViewOfSection},
     {FNV("NtReadVirtualMemory"), ULONG_MAX, nullptr, &hkNtReadVirtualMemory},
     {FNV("NtQueryVirtualMemory"), ULONG_MAX, nullptr, &hkNtQueryVirtualMemory},
     {FNV("NtQuerySystemInformation"), ULONG_MAX, nullptr, &hkNtQuerySystemInformation},
+    {FNV("NtQueryLicenseValue"), ULONG_MAX, nullptr, &hkNtQueryLicenseValue},
 };
 
 void __fastcall SsdtCallback(ULONG ssdt_index, VOID **ssdt_address);

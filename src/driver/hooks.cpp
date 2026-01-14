@@ -46,6 +46,7 @@ decltype(&ZwQuerySystemInformation) oNtQuerySystemInformation = nullptr;
 decltype(&NtReadVirtualMemory) oNtReadVirtualMemory = nullptr;
 decltype(&NtQueryVirtualMemory) oNtQueryVirtualMemory = nullptr;
 decltype(&ZwMapViewOfSection) oNtMapViewOfSection = nullptr;
+decltype(&ZwQueryLicenseValue) oNtQueryLicenseValue = nullptr;
 
 void __fastcall SsdtCallback(ULONG ServiceIndex, PVOID *ServiceAddress)
 {
@@ -360,11 +361,9 @@ NTSTATUS NTAPI hkNtQuerySystemInformation(IN SYSTEM_INFORMATION_CLASS SystemInfo
 
     NTSTATUS Status =
         oNtQuerySystemInformation(SystemInformationClass, SystemInformation, SystemInformationLength, ReturnLength);
-    const HANDLE currentPid = PsGetCurrentProcessId();
 
-    // Spoof any process in list from the following queries
-    //
-    if (GetPreviousMode() != UserMode || !Processes::IsProcessInList(currentPid))
+    // Apply code integrity spoofing to ALL usermode threads
+    if (GetPreviousMode() != UserMode)
     {
         goto Exit;
     }
@@ -527,6 +526,63 @@ Exit:
     return Status;
 }
 
+NTSTATUS NTAPI hkNtQueryLicenseValue(_In_ PUNICODE_STRING ValueName, _Out_opt_ PULONG Type,
+                                     _Out_writes_bytes_to_opt_(DataSize, *ResultDataSize) PVOID Data,
+                                     _In_ ULONG DataSize, _Out_ PULONG ResultDataSize)
+{
+    InterlockedIncrement(&g_hooksRefCount);
+    SCOPE_EXIT
+    {
+        InterlockedDecrement(&g_hooksRefCount);
+    };
+
+    // Check if this is the CodeIntegrity-AllowUnsignedDrivers query
+    if (GetPreviousMode() == UserMode && ValueName && ValueName->Buffer)
+    {
+        __try
+        {
+            ProbeForRead(ValueName->Buffer, ValueName->Length, sizeof(WCHAR));
+
+            UNICODE_STRING targetName;
+            RtlInitUnicodeString(&targetName, L"CodeIntegrity-AllowUnsignedDrivers");
+
+            if (RtlEqualUnicodeString(ValueName, &targetName, TRUE))
+            {
+                WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL,
+                          "NtQueryLicenseValue(CodeIntegrity-AllowUnsignedDrivers) - returning 0");
+
+                // Return 0 (unsigned drivers NOT allowed) instead of actual value
+                if (Data && DataSize >= sizeof(ULONG))
+                {
+                    ProbeForWrite(Data, sizeof(ULONG), sizeof(ULONG));
+                    *(PULONG)Data = 0;
+                }
+
+                if (Type)
+                {
+                    ProbeForWrite(Type, sizeof(ULONG), sizeof(ULONG));
+                    *Type = REG_DWORD;
+                }
+
+                if (ResultDataSize)
+                {
+                    ProbeForWrite(ResultDataSize, sizeof(ULONG), sizeof(ULONG));
+                    *ResultDataSize = sizeof(ULONG);
+                }
+
+                return STATUS_SUCCESS;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            // Fall through to original call
+        }
+    }
+
+    // Call original for all other queries
+    return oNtQueryLicenseValue(ValueName, Type, Data, DataSize, ResultDataSize);
+}
+
 BOOLEAN CreateHook(const FNV1A_t ServiceNameHash, PVOID *OriginalRoutine)
 {
     for (auto &entry : g_SyscallHookList)
@@ -562,9 +618,8 @@ NTSTATUS Initialize()
     CREATE_HOOK(NtMapViewOfSection);
     CREATE_HOOK(NtReadVirtualMemory);
     CREATE_HOOK(NtQueryVirtualMemory);
-#if DBG
     CREATE_HOOK(NtQuerySystemInformation);
-#endif
+    CREATE_HOOK(NtQueryLicenseValue);
 
 #undef CREATE_HOOK
 

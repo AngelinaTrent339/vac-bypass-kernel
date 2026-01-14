@@ -110,39 +110,10 @@ void ProcessCallback(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId,
 
         NTSTATUS status;
 
-        UNICODE_STRING steamService{};
-        RtlInitUnicodeString(&steamService, L"steamservice.exe");
+        UNICODE_STRING robloxPlayer{};
+        RtlInitUnicodeString(&robloxPlayer, L"RobloxPlayerBeta.exe");
 
-        UNICODE_STRING steam{};
-        RtlInitUnicodeString(&steam, L"steam.exe");
-
-        UNICODE_STRING cs2{};
-        RtlInitUnicodeString(&cs2, L"cs2.exe");
-
-        if (RtlSuffixUnicodeString(&steamService, CreateNotifyInfo->ImageFileName, TRUE))
-        {
-            WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, "Adding image %wZ (%d) to steam service list",
-                      CreateNotifyInfo->ImageFileName, HandleToULong(ProcessId));
-
-            status = Processes::AddProcessSteamService(ProcessId);
-            if (!NT_SUCCESS(status))
-            {
-                WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "AddProcessSteamService returned %!STATUS!", status);
-            }
-        }
-        else if (RtlSuffixUnicodeString(&steam, CreateNotifyInfo->ImageFileName, TRUE))
-        {
-            WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, "Adding image %wZ (%d) to steam list",
-                      CreateNotifyInfo->ImageFileName, HandleToULong(ProcessId));
-
-            status = Processes::AddProcessSteam(ProcessId);
-            if (!NT_SUCCESS(status))
-            {
-                WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "AddProcessSteam returned %!STATUS!", status);
-            }
-        }
-        else if (Processes::IsProcessSteam(CreateNotifyInfo->ParentProcessId) &&
-                 RtlSuffixUnicodeString(&cs2, CreateNotifyInfo->ImageFileName, TRUE) && !gameFound)
+        if (RtlSuffixUnicodeString(&robloxPlayer, CreateNotifyInfo->ImageFileName, TRUE) && !gameFound)
         {
             gameFound = true;
 
@@ -156,7 +127,7 @@ void ProcessCallback(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId,
             }
 
 #if (SYSCALL_HOOK_TYPE == SYSCALL_HOOK_ALT_SYSCALL)
-            // Enable Alt Syscall for the game process
+            // Enable Alt Syscall for Roblox process
             if (SyscallHook::g_AltSyscallRegistered)
             {
                 status = SyscallHook::EnableAltSyscallForProcess(Process);
@@ -168,7 +139,7 @@ void ProcessCallback(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId,
                 else
                 {
                     WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, 
-                              "Alt Syscall enabled for game process %d", HandleToULong(ProcessId));
+                              "Alt Syscall enabled for Roblox process %d", HandleToULong(ProcessId));
                 }
             }
 #endif
