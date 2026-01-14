@@ -1192,8 +1192,9 @@ NTSTATUS InitializeAltSyscallHook()
     
     DBG_PRINT("[AltSyscall] Installed dispatch table at slot %u", ALT_SYSCALL_SLOT_ID);
     
-    // Enable alt syscalls for all running processes
-    WalkActiveProcessesAndSetBits(true);
+    // DON'T enable for all processes at startup - this causes system hangs!
+    // Alt Syscall will only be enabled for Roblox when it starts via process callback
+    // WalkActiveProcessesAndSetBits(true);  // DISABLED - causes system hang
     
     g_AltSyscallRegistered = true;
     
