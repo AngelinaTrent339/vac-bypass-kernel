@@ -705,7 +705,7 @@ Exit:
 #pragma pack(push, 1)
 typedef struct _ALT_SYSCALL_DISPATCH_TABLE
 {
-    ULONG64 Count;                              // Number of SSNs we provide for (capacity)
+    ULONG Count;                                // Number of SSNs we provide for (capacity) - MUST be ULONG
     ULONG Descriptors[ALT_SYSCALL_SSN_COUNT];   // Array of (RVA << 4) | flags
 } ALT_SYSCALL_DISPATCH_TABLE, *PALT_SYSCALL_DISPATCH_TABLE;
 
@@ -746,8 +746,8 @@ constexpr ULONG OFFSET_ETHREAD_THREAD_LIST_ENTRY = 0x578;
 // Alt syscall enable bit in DebugActive
 constexpr UCHAR ALT_SYSCALL_DEBUG_ACTIVE_BIT = 0x20;
 
-// Slot ID we use (0 is typically safe, but could use 0-19)
-constexpr ULONG ALT_SYSCALL_SLOT_ID = 0;
+// Slot ID we use (avoid 0 as it may be reserved, use 1-19)
+constexpr ULONG ALT_SYSCALL_SLOT_ID = 1;
 
 // Flags for the dispatch table entries
 constexpr ULONG GENERIC_PATH_FLAGS = 0x10;  // Use PspSyscallProviderServiceDispatchGeneric
@@ -1168,18 +1168,26 @@ NTSTATUS InitializeAltSyscallHook()
     // flags = 0x10 for generic path + number of stack QWORDs to copy
     ULONG DescriptorValue = (static_cast<ULONG>(RvaOffset) << 4) | (GENERIC_PATH_FLAGS | (NUM_STACK_ARGS_TO_COPY & 0x0F));
     
+    DBG_PRINT("[AltSyscall] Filling descriptor table with value 0x%08X", DescriptorValue);
+    
     for (ULONG i = 0; i < ALT_SYSCALL_SSN_COUNT; i++)
     {
         g_AltSyscallDispatchTable->Descriptors[i] = DescriptorValue;
     }
     
+    DBG_PRINT("[AltSyscall] Descriptor table filled, writing to PspServiceDescriptorGroupTable...");
+    
     // Write our row to PspServiceDescriptorGroupTable
     // NOTE: This will fail if HVCI is enabled!
     __try
     {
+        DBG_PRINT("[AltSyscall] Writing DriverBase...");
         g_PspServiceDescriptorGroupTable->Rows[ALT_SYSCALL_SLOT_ID].DriverBase = g_DriverBase;
+        DBG_PRINT("[AltSyscall] Writing DispatchTable...");
         g_PspServiceDescriptorGroupTable->Rows[ALT_SYSCALL_SLOT_ID].DispatchTable = g_AltSyscallDispatchTable;
+        DBG_PRINT("[AltSyscall] Writing Reserved...");
         g_PspServiceDescriptorGroupTable->Rows[ALT_SYSCALL_SLOT_ID].Reserved = nullptr;
+        DBG_PRINT("[AltSyscall] Write complete!");
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
