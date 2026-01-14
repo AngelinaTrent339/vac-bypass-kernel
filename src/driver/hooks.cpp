@@ -918,7 +918,8 @@ NTSTATUS NTAPI hkNtQueryInformationProcess(_In_ HANDLE ProcessHandle, _In_ PROCE
                 WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, "NtQueryInformationProcess(ProcessDebugFlags) by %d",
                           HandleToUlong(currentPid));
                 ProbeForWrite(ProcessInformation, sizeof(ULONG), 1);
-                *(PULONG)ProcessInformation = PROCESS_DEBUG_INHERIT; // 1 = not being debugged
+                // PROCESS_DEBUG_INHERIT = 1 means "not being debugged"
+                *(PULONG)ProcessInformation = 1;
             }
             break;
 
@@ -1069,8 +1070,10 @@ NTSTATUS NTAPI hkNtResumeThread(_In_ HANDLE ThreadHandle, _Out_opt_ PULONG Previ
 //=============================================================================
 
 // Global flag to indicate next allocation should be hidden
-inline thread_local bool g_nextAllocationHidden = false;
-inline thread_local HANDLE g_nextAllocationPid = nullptr;
+// Note: Using static instead of thread_local (not supported in kernel)
+// This is safe because we only set it immediately before ZwAllocateVirtualMemory call
+static bool g_nextAllocationHidden = false;
+static HANDLE g_nextAllocationPid = nullptr;
 
 void SetNextAllocationHidden(HANDLE ProcessId)
 {
@@ -1127,7 +1130,8 @@ NTSTATUS NTAPI hkNtClose(_In_ HANDLE Handle)
     {
         // Anti-debug trick: NtClose with invalid handle raises exception if debugged
         // We silently fail instead of raising exception
-        if (Handle == NULL || Handle == INVALID_HANDLE_VALUE)
+        // INVALID_HANDLE_VALUE = (HANDLE)(LONG_PTR)-1
+        if (Handle == NULL || Handle == (HANDLE)(LONG_PTR)-1)
         {
             return STATUS_INVALID_HANDLE;
         }
@@ -1135,7 +1139,7 @@ NTSTATUS NTAPI hkNtClose(_In_ HANDLE Handle)
         // Check if handle is valid before closing
         POBJECT_HANDLE_FLAG_INFORMATION handleInfo = {0};
         NTSTATUS queryStatus =
-            ZwQueryObject(Handle, ObjectHandleFlagInformation, &handleInfo, sizeof(handleInfo), NULL);
+            ZwQueryObject(Handle, (OBJECT_INFORMATION_CLASS)ObjectHandleFlagInformation, &handleInfo, sizeof(handleInfo), NULL);
 
         if (!NT_SUCCESS(queryStatus))
         {
