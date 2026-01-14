@@ -77,13 +77,20 @@ HijackShellcodeV2 PROC
     ; RCX = HIJACK_CONTEXT pointer
     
     ; === Save XMM registers immediately (they're volatile) ===
-    ; Note: Context buffer must be 16-byte aligned for movaps
-    movaps  xmmword ptr [rcx + CTX_OriginalXmm0], xmm0
-    movaps  xmmword ptr [rcx + CTX_OriginalXmm1], xmm1
-    movaps  xmmword ptr [rcx + CTX_OriginalXmm2], xmm2
-    movaps  xmmword ptr [rcx + CTX_OriginalXmm3], xmm3
-    movaps  xmmword ptr [rcx + CTX_OriginalXmm4], xmm4
-    movaps  xmmword ptr [rcx + CTX_OriginalXmm5], xmm5
+    ; Use movups (unaligned) - does not require 16-byte alignment
+    ; This is safer than movaps even though context is page-aligned
+    movups  xmmword ptr [rcx + CTX_OriginalXmm0], xmm0
+    movups  xmmword ptr [rcx + CTX_OriginalXmm1], xmm1
+    movups  xmmword ptr [rcx + CTX_OriginalXmm2], xmm2
+    movups  xmmword ptr [rcx + CTX_OriginalXmm3], xmm3
+    movups  xmmword ptr [rcx + CTX_OriginalXmm4], xmm4
+    movups  xmmword ptr [rcx + CTX_OriginalXmm5], xmm5
+    
+    ; === Save RFLAGS immediately (before any flag-modifying instructions) ===
+    ; movups does NOT modify flags, so RFLAGS still contains original values
+    ; Must save before: test, cmp, bt, sub, add, dec, and, or, shr, etc.
+    pushfq
+    pop     qword ptr [rcx + CTX_OriginalRflags]
     
     ; === Setup stack frame with proper alignment ===
     ; x64 ABI: RSP must be 16-byte aligned BEFORE call instruction
@@ -100,8 +107,12 @@ HijackShellcodeV2 PROC
     push    r14
     push    r15
     
-    ; Align stack: 7 pushes (56 bytes) + rbp (8) = 64 bytes pushed
-    ; Stack is now 16-byte aligned. sub 8 to make it 16n+8 for calls
+    ; Stack alignment math:
+    ; - Entry: RSP = 16n+8 (kernel sets (original & ~0xF) - 8)
+    ; - After push rbp: RSP = 16n (aligned)
+    ; - After 7 more pushes (56 bytes): RSP = 16n - 56 = 16m + 8
+    ; - After sub 28h (40): RSP = 16m + 8 - 40 = 16k (aligned for calls)
+    ; x64 ABI: RSP must be 16-aligned before CALL instruction
     sub     rsp, 28h                    ; 0x20 shadow + 0x8 alignment = 0x28
     
     ; === Save context pointer in non-volatile register ===
@@ -278,18 +289,21 @@ fail:
     mov     dword ptr [rbx + CTX_ErrorCode], 1
 
 done:
-    ; === Signal completion (atomic write) ===
-    mov     dword ptr [rbx + CTX_Completed], 1
+    ; === Signal completion (atomic write using XCHG with implicit LOCK) ===
+    ; xchg with memory operand has implicit lock prefix - fully atomic
+    mov     eax, 1
+    xchg    dword ptr [rbx + CTX_Completed], eax
     
     ; === Epilogue: Restore everything and return to hijacked location ===
     
     ; First restore XMM from context (need RBX for addressing)
-    movaps  xmm0, xmmword ptr [rbx + CTX_OriginalXmm0]
-    movaps  xmm1, xmmword ptr [rbx + CTX_OriginalXmm1]
-    movaps  xmm2, xmmword ptr [rbx + CTX_OriginalXmm2]
-    movaps  xmm3, xmmword ptr [rbx + CTX_OriginalXmm3]
-    movaps  xmm4, xmmword ptr [rbx + CTX_OriginalXmm4]
-    movaps  xmm5, xmmword ptr [rbx + CTX_OriginalXmm5]
+    ; Use movups (unaligned) for safety
+    movups  xmm0, xmmword ptr [rbx + CTX_OriginalXmm0]
+    movups  xmm1, xmmword ptr [rbx + CTX_OriginalXmm1]
+    movups  xmm2, xmmword ptr [rbx + CTX_OriginalXmm2]
+    movups  xmm3, xmmword ptr [rbx + CTX_OriginalXmm3]
+    movups  xmm4, xmmword ptr [rbx + CTX_OriginalXmm4]
+    movups  xmm5, xmmword ptr [rbx + CTX_OriginalXmm5]
     
     ; Restore GPRs from original context (thread was hijacked mid-execution)
     mov     rax, [rbx + CTX_OriginalRax]
@@ -310,6 +324,13 @@ done:
     ; Setup stack to return to original RIP
     ; We completely replace RSP and push return address
     mov     rsp, [rbx + CTX_OriginalRsp]
+    
+    ; Restore RFLAGS before returning
+    ; Push saved RFLAGS then popfq to restore
+    push    qword ptr [rbx + CTX_OriginalRflags]
+    popfq
+    
+    ; Push return address for ret instruction
     push    qword ptr [rbx + CTX_OriginalRip]
     
     ; Restore RBX absolutely last (we were using it for context addressing)

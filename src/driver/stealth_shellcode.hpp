@@ -69,7 +69,7 @@ typedef struct _HIJACK_CONTEXT
     ULONG64 pGetProcAddress;         // 0x158: kernel32!GetProcAddress
     ULONG64 pNtFlushInstructionCache;// 0x160: ntdll!NtFlushInstructionCache
     ULONG64 pLdrpHandleTlsData;      // 0x168: ntdll!LdrpHandleTlsData (optional)
-    ULONG64 pRtlAddVectoredExceptionHandler; // 0x170: ntdll!RtlAddVectoredExceptionHandler (optional)
+    ULONG64 pRtlAddVectoredExceptionHandler; // 0x170: Reserved - VEH not used in current impl
 
 } HIJACK_CONTEXT, *PHIJACK_CONTEXT;
 #pragma pack(pop)
