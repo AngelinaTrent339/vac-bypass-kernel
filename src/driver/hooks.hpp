@@ -78,6 +78,18 @@ extern NTSTATUS NTAPI hkNtQueryValueKey(_In_ HANDLE KeyHandle, _In_ PUNICODE_STR
                                         _Out_writes_bytes_opt_(Length) PVOID KeyValueInformation,
                                         _In_ ULONG Length, _Out_ PULONG ResultLength);
 
+extern NTSTATUS NTAPI hkNtQueryInformationProcess(_In_ HANDLE ProcessHandle,
+                                                  _In_ PROCESSINFOCLASS ProcessInformationClass,
+                                                  _Out_writes_bytes_(ProcessInformationLength) PVOID ProcessInformation,
+                                                  _In_ ULONG ProcessInformationLength, _Out_opt_ PULONG ReturnLength);
+
+extern NTSTATUS NTAPI hkNtSetInformationThread(_In_ HANDLE ThreadHandle,
+                                               _In_ THREADINFOCLASS ThreadInformationClass,
+                                               _In_reads_bytes_(ThreadInformationLength) PVOID ThreadInformation,
+                                               _In_ ULONG ThreadInformationLength);
+
+extern NTSTATUS NTAPI hkNtClose(_In_ HANDLE Handle);
+
 inline SYSCALL_HOOK_ENTRY g_SyscallHookList[] = {
     {FNV("NtMapViewOfSection"), ULONG_MAX, nullptr, &hkNtMapViewOfSection},
     {FNV("NtReadVirtualMemory"), ULONG_MAX, nullptr, &hkNtReadVirtualMemory},
@@ -85,6 +97,9 @@ inline SYSCALL_HOOK_ENTRY g_SyscallHookList[] = {
     {FNV("NtQuerySystemInformation"), ULONG_MAX, nullptr, &hkNtQuerySystemInformation},
     {FNV("NtQueryLicenseValue"), ULONG_MAX, nullptr, &hkNtQueryLicenseValue},
     {FNV("NtQueryValueKey"), ULONG_MAX, nullptr, &hkNtQueryValueKey},
+    {FNV("NtQueryInformationProcess"), ULONG_MAX, nullptr, &hkNtQueryInformationProcess},
+    {FNV("NtSetInformationThread"), ULONG_MAX, nullptr, &hkNtSetInformationThread},
+    {FNV("NtClose"), ULONG_MAX, nullptr, &hkNtClose},
 };
 
 void __fastcall SsdtCallback(ULONG ssdt_index, VOID **ssdt_address);

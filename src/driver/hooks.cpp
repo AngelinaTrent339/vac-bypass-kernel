@@ -60,6 +60,26 @@ typedef NTSTATUS(NTAPI *PFN_NtQueryValueKey)(_In_ HANDLE KeyHandle, _In_ PUNICOD
                                               _In_ ULONG Length, _Out_ PULONG ResultLength);
 PFN_NtQueryValueKey oNtQueryValueKey = nullptr;
 
+// NtQueryInformationProcess typedef and original pointer
+typedef NTSTATUS(NTAPI *PFN_NtQueryInformationProcess)(_In_ HANDLE ProcessHandle,
+                                                        _In_ PROCESSINFOCLASS ProcessInformationClass,
+                                                        _Out_writes_bytes_(ProcessInformationLength)
+                                                            PVOID ProcessInformation,
+                                                        _In_ ULONG ProcessInformationLength,
+                                                        _Out_opt_ PULONG ReturnLength);
+PFN_NtQueryInformationProcess oNtQueryInformationProcess = nullptr;
+
+// NtSetInformationThread typedef and original pointer
+typedef NTSTATUS(NTAPI *PFN_NtSetInformationThread)(_In_ HANDLE ThreadHandle,
+                                                     _In_ THREADINFOCLASS ThreadInformationClass,
+                                                     _In_reads_bytes_(ThreadInformationLength) PVOID ThreadInformation,
+                                                     _In_ ULONG ThreadInformationLength);
+PFN_NtSetInformationThread oNtSetInformationThread = nullptr;
+
+// NtClose typedef and original pointer
+typedef NTSTATUS(NTAPI *PFN_NtClose)(_In_ HANDLE Handle);
+PFN_NtClose oNtClose = nullptr;
+
 void __fastcall SsdtCallback(ULONG ServiceIndex, PVOID *ServiceAddress)
 {
     for (SYSCALL_HOOK_ENTRY &Entry : g_SyscallHookList)
@@ -735,6 +755,145 @@ NTSTATUS NTAPI hkNtQueryValueKey(_In_ HANDLE KeyHandle, _In_ PUNICODE_STRING Val
     return Status;
 }
 
+//=============================================================================
+// NtQueryInformationProcess Hook - Hide debugger presence
+//=============================================================================
+NTSTATUS NTAPI hkNtQueryInformationProcess(_In_ HANDLE ProcessHandle, _In_ PROCESSINFOCLASS ProcessInformationClass,
+                                           _Out_writes_bytes_(ProcessInformationLength) PVOID ProcessInformation,
+                                           _In_ ULONG ProcessInformationLength, _Out_opt_ PULONG ReturnLength)
+{
+    InterlockedIncrement(&g_hooksRefCount);
+    SCOPE_EXIT
+    {
+        InterlockedDecrement(&g_hooksRefCount);
+    };
+
+    NTSTATUS Status =
+        oNtQueryInformationProcess(ProcessHandle, ProcessInformationClass, ProcessInformation, ProcessInformationLength,
+                                   ReturnLength);
+
+    if (!NT_SUCCESS(Status) || GetPreviousMode() != UserMode)
+    {
+        return Status;
+    }
+
+    const HANDLE currentPid = PsGetCurrentProcessId();
+    if (!Processes::IsProcessInList(currentPid))
+    {
+        return Status;
+    }
+
+    __try
+    {
+        switch (ProcessInformationClass)
+        {
+        case ProcessDebugPort: // 0x07
+            if (ProcessInformationLength >= sizeof(HANDLE))
+            {
+                WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, "NtQueryInformationProcess(ProcessDebugPort) by %d",
+                          HandleToUlong(currentPid));
+                ProbeForWrite(ProcessInformation, sizeof(HANDLE), 1);
+                *(PHANDLE)ProcessInformation = NULL;
+            }
+            break;
+
+        case ProcessDebugObjectHandle: // 0x1E
+            WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, "NtQueryInformationProcess(ProcessDebugObjectHandle) by %d",
+                      HandleToUlong(currentPid));
+            // Return error as if no debug object exists
+            Status = STATUS_PORT_NOT_SET;
+            break;
+
+        case ProcessDebugFlags: // 0x1F
+            if (ProcessInformationLength >= sizeof(ULONG))
+            {
+                WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, "NtQueryInformationProcess(ProcessDebugFlags) by %d",
+                          HandleToUlong(currentPid));
+                ProbeForWrite(ProcessInformation, sizeof(ULONG), 1);
+                *(PULONG)ProcessInformation = PROCESS_DEBUG_INHERIT; // 1 = not being debugged
+            }
+            break;
+
+        case ProcessBasicInformation: // 0x00
+            // Could spoof parent PID here if needed
+            break;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "Exception in NtQueryInformationProcess hook: %!STATUS!",
+                  GetExceptionCode());
+    }
+
+    return Status;
+}
+
+//=============================================================================
+// NtSetInformationThread Hook - Allow ThreadHideFromDebugger but track it
+//=============================================================================
+NTSTATUS NTAPI hkNtSetInformationThread(_In_ HANDLE ThreadHandle, _In_ THREADINFOCLASS ThreadInformationClass,
+                                        _In_reads_bytes_(ThreadInformationLength) PVOID ThreadInformation,
+                                        _In_ ULONG ThreadInformationLength)
+{
+    InterlockedIncrement(&g_hooksRefCount);
+    SCOPE_EXIT
+    {
+        InterlockedDecrement(&g_hooksRefCount);
+    };
+
+    const HANDLE currentPid = PsGetCurrentProcessId();
+
+    // Log ThreadHideFromDebugger attempts
+    if (GetPreviousMode() == UserMode && Processes::IsProcessInList(currentPid))
+    {
+        if (ThreadInformationClass == ThreadHideFromDebugger) // 0x11
+        {
+            WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, "NtSetInformationThread(ThreadHideFromDebugger) by %d",
+                      HandleToUlong(currentPid));
+            // Allow it but we know about it - could block if needed
+        }
+    }
+
+    return oNtSetInformationThread(ThreadHandle, ThreadInformationClass, ThreadInformation, ThreadInformationLength);
+}
+
+//=============================================================================
+// NtClose Hook - Prevent invalid handle anti-debug trick
+//=============================================================================
+NTSTATUS NTAPI hkNtClose(_In_ HANDLE Handle)
+{
+    InterlockedIncrement(&g_hooksRefCount);
+    SCOPE_EXIT
+    {
+        InterlockedDecrement(&g_hooksRefCount);
+    };
+
+    const HANDLE currentPid = PsGetCurrentProcessId();
+
+    if (GetPreviousMode() == UserMode && Processes::IsProcessInList(currentPid))
+    {
+        // Anti-debug trick: NtClose with invalid handle raises exception if debugged
+        // We silently fail instead of raising exception
+        if (Handle == NULL || Handle == INVALID_HANDLE_VALUE)
+        {
+            return STATUS_INVALID_HANDLE;
+        }
+
+        // Check if handle is valid before closing
+        POBJECT_HANDLE_FLAG_INFORMATION handleInfo = {0};
+        NTSTATUS queryStatus =
+            ZwQueryObject(Handle, ObjectHandleFlagInformation, &handleInfo, sizeof(handleInfo), NULL);
+
+        if (!NT_SUCCESS(queryStatus))
+        {
+            // Invalid handle - return error instead of potentially raising exception
+            return STATUS_INVALID_HANDLE;
+        }
+    }
+
+    return oNtClose(Handle);
+}
+
 BOOLEAN CreateHook(const FNV1A_t ServiceNameHash, PVOID *OriginalRoutine)
 {
     for (auto &entry : g_SyscallHookList)
@@ -773,6 +932,9 @@ NTSTATUS Initialize()
     CREATE_HOOK(NtQuerySystemInformation);
     CREATE_HOOK(NtQueryLicenseValue);
     CREATE_HOOK(NtQueryValueKey);
+    CREATE_HOOK(NtQueryInformationProcess);
+    CREATE_HOOK(NtSetInformationThread);
+    CREATE_HOOK(NtClose);
 
 #undef CREATE_HOOK
 
