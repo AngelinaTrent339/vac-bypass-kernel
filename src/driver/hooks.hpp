@@ -26,9 +26,11 @@
 #define SYSCALL_HOOK_INFINITY_HOOK 0
 #define SYSCALL_HOOK_SSDT_HOOK 1
 
-#ifndef SYSCALL_HOOK_TYPE
-#define SYSCALL_HOOK_TYPE SYSCALL_HOOK_SSDT_HOOK
+// Force SSDT hook - disable infinity hook (alt syscall)
+#ifdef SYSCALL_HOOK_TYPE
+#undef SYSCALL_HOOK_TYPE
 #endif
+#define SYSCALL_HOOK_TYPE SYSCALL_HOOK_SSDT_HOOK
 
 namespace Hooks
 {
