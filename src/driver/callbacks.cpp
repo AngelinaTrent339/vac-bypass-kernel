@@ -102,6 +102,12 @@ void ProcessCallback(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId,
         UNICODE_STRING cs2{};
         RtlInitUnicodeString(&cs2, L"cs2.exe");
 
+        UNICODE_STRING robloxPlayer{};
+        RtlInitUnicodeString(&robloxPlayer, L"RobloxPlayerBeta.exe");
+
+        UNICODE_STRING robloxApp{};
+        RtlInitUnicodeString(&robloxApp, L"RobloxPlayerLauncher.exe");
+
         if (RtlSuffixUnicodeString(&steamService, CreateNotifyInfo->ImageFileName, TRUE))
         {
             WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, "Adding image %wZ (%d) to steam service list",
@@ -130,6 +136,18 @@ void ProcessCallback(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId,
             gameFound = true;
 
             WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, "Adding image %wZ (%d) to game list",
+                      CreateNotifyInfo->ImageFileName, HandleToULong(ProcessId));
+
+            status = Processes::AddProcessGame(ProcessId);
+            if (!NT_SUCCESS(status))
+            {
+                WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "AddProcessGame returned %!STATUS!", status);
+            }
+        }
+        else if (RtlSuffixUnicodeString(&robloxPlayer, CreateNotifyInfo->ImageFileName, TRUE) ||
+                 RtlSuffixUnicodeString(&robloxApp, CreateNotifyInfo->ImageFileName, TRUE))
+        {
+            WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, "Adding image %wZ (%d) to game list (Roblox)",
                       CreateNotifyInfo->ImageFileName, HandleToULong(ProcessId));
 
             status = Processes::AddProcessGame(ProcessId);
