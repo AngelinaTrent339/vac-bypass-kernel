@@ -878,13 +878,51 @@ PVOID FindPspServiceDescriptorGroupTable()
     
     DBG_PRINT("[AltSyscall] Scanning ntoskrnl at 0x%p, size 0x%X", BaseAddress, ImageSize);
     
-    PUCHAR FunctionAddress = nullptr;
-    for (ULONG i = 0; i < ImageSize - sizeof(PsSyscallProviderDispatchPattern); i++)
+    // Only scan the .text section to avoid paged/discardable sections
+    PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(nth);
+    PUCHAR TextStart = nullptr;
+    ULONG TextSize = 0;
+    
+    for (USHORT i = 0; i < nth->FileHeader.NumberOfSections; i++)
     {
-        if (RtlCompareMemory(BaseAddress + i, PsSyscallProviderDispatchPattern, 
+        if (RtlCompareMemory(section[i].Name, ".text", 5) == 5 ||
+            RtlCompareMemory(section[i].Name, "PAGE", 4) == 4)
+        {
+            // Skip PAGE sections, only use .text
+            if (RtlCompareMemory(section[i].Name, ".text", 5) == 5)
+            {
+                TextStart = BaseAddress + section[i].VirtualAddress;
+                TextSize = section[i].Misc.VirtualSize;
+                DBG_PRINT("[AltSyscall] Found .text at 0x%p, size 0x%X", TextStart, TextSize);
+                break;
+            }
+        }
+    }
+    
+    if (!TextStart || TextSize == 0)
+    {
+        // Fallback: scan first 2MB which should be non-paged
+        TextStart = BaseAddress;
+        TextSize = min(ImageSize, 0x200000);
+        DBG_PRINT("[AltSyscall] .text not found, scanning first 0x%X bytes", TextSize);
+    }
+    
+    PUCHAR FunctionAddress = nullptr;
+    for (ULONG i = 0; i < TextSize - sizeof(PsSyscallProviderDispatchPattern); i++)
+    {
+        PUCHAR CurrentAddr = TextStart + i;
+        
+        // Check if address is valid before reading
+        if (!MmIsAddressValid(CurrentAddr) || 
+            !MmIsAddressValid(CurrentAddr + sizeof(PsSyscallProviderDispatchPattern) - 1))
+        {
+            continue;
+        }
+        
+        if (RtlCompareMemory(CurrentAddr, PsSyscallProviderDispatchPattern, 
                              sizeof(PsSyscallProviderDispatchPattern)) == sizeof(PsSyscallProviderDispatchPattern))
         {
-            FunctionAddress = BaseAddress + i;
+            FunctionAddress = CurrentAddr;
             break;
         }
     }
