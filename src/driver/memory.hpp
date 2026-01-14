@@ -35,6 +35,7 @@ static constexpr ULONG TAG_SYSCALL_TABLE = '6CAV';
 static constexpr ULONG TAG_SYSCALL_HOOK = '7CAV';
 static constexpr ULONG TAG_CLASS = '8CAV';
 static constexpr ULONG TAG_RESOURCE = '9CAV';
+static constexpr ULONG TAG_TEMP = 'TMAV';  // Temporary allocations
 
 /// <summary>
 /// Allocates non paged pool zero

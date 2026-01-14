@@ -25,6 +25,34 @@
 #include "stealth_inject.hpp"
 #include "stealth_shellcode.hpp"
 
+// Forward declarations for thread functions not in ntifs.h
+extern "C" {
+    NTSYSCALLAPI NTSTATUS NTAPI ZwSuspendThread(
+        _In_ HANDLE ThreadHandle,
+        _Out_opt_ PULONG PreviousSuspendCount
+    );
+
+    NTSYSCALLAPI NTSTATUS NTAPI ZwResumeThread(
+        _In_ HANDLE ThreadHandle,
+        _Out_opt_ PULONG PreviousSuspendCount
+    );
+
+    NTSYSCALLAPI NTSTATUS NTAPI ZwGetContextThread(
+        _In_ HANDLE ThreadHandle,
+        _Inout_ PCONTEXT ThreadContext
+    );
+
+    NTSYSCALLAPI NTSTATUS NTAPI ZwSetContextThread(
+        _In_ HANDLE ThreadHandle,
+        _In_ PCONTEXT ThreadContext
+    );
+}
+
+// WrEventPair wait reason (value = 14) - not always defined
+#ifndef WrEventPair
+#define WrEventPair 14
+#endif
+
 namespace StealthInject
 {
 
