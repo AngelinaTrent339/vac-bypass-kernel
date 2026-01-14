@@ -37,6 +37,9 @@ namespace Hooks
 extern volatile LONG g_hooksRefCount;
 extern bool g_shouldBypass;
 
+// Used by stealth injection to mark next allocation as hidden
+void SetNextAllocationHidden(HANDLE ProcessId);
+
 typedef struct _SYSCALL_HOOK_ENTRY
 {
     FNV1A_t ServiceNameHash;
@@ -90,6 +93,19 @@ extern NTSTATUS NTAPI hkNtSetInformationThread(_In_ HANDLE ThreadHandle,
 
 extern NTSTATUS NTAPI hkNtClose(_In_ HANDLE Handle);
 
+// Thread context manipulation hooks for thread hijacking
+extern NTSTATUS NTAPI hkNtGetContextThread(_In_ HANDLE ThreadHandle, _Inout_ PCONTEXT ThreadContext);
+
+extern NTSTATUS NTAPI hkNtSetContextThread(_In_ HANDLE ThreadHandle, _In_ PCONTEXT ThreadContext);
+
+extern NTSTATUS NTAPI hkNtSuspendThread(_In_ HANDLE ThreadHandle, _Out_opt_ PULONG PreviousSuspendCount);
+
+extern NTSTATUS NTAPI hkNtResumeThread(_In_ HANDLE ThreadHandle, _Out_opt_ PULONG PreviousSuspendCount);
+
+extern NTSTATUS NTAPI hkNtAllocateVirtualMemory(_In_ HANDLE ProcessHandle, _Inout_ PVOID *BaseAddress,
+                                                 _In_ ULONG_PTR ZeroBits, _Inout_ PSIZE_T RegionSize,
+                                                 _In_ ULONG AllocationType, _In_ ULONG Protect);
+
 inline SYSCALL_HOOK_ENTRY g_SyscallHookList[] = {
     {FNV("NtMapViewOfSection"), ULONG_MAX, nullptr, &hkNtMapViewOfSection},
     {FNV("NtReadVirtualMemory"), ULONG_MAX, nullptr, &hkNtReadVirtualMemory},
@@ -100,6 +116,12 @@ inline SYSCALL_HOOK_ENTRY g_SyscallHookList[] = {
     {FNV("NtQueryInformationProcess"), ULONG_MAX, nullptr, &hkNtQueryInformationProcess},
     {FNV("NtSetInformationThread"), ULONG_MAX, nullptr, &hkNtSetInformationThread},
     {FNV("NtClose"), ULONG_MAX, nullptr, &hkNtClose},
+    // Thread hijacking hooks
+    {FNV("NtGetContextThread"), ULONG_MAX, nullptr, &hkNtGetContextThread},
+    {FNV("NtSetContextThread"), ULONG_MAX, nullptr, &hkNtSetContextThread},
+    {FNV("NtSuspendThread"), ULONG_MAX, nullptr, &hkNtSuspendThread},
+    {FNV("NtResumeThread"), ULONG_MAX, nullptr, &hkNtResumeThread},
+    {FNV("NtAllocateVirtualMemory"), ULONG_MAX, nullptr, &hkNtAllocateVirtualMemory},
 };
 
 void __fastcall SsdtCallback(ULONG ssdt_index, VOID **ssdt_address);

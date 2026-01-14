@@ -117,6 +117,14 @@
     <ClInclude Include="hde\table64.h">
       <Filter>Header Files\third-party\hde</Filter>
     </ClInclude>
+    <ClInclude Include="stealth_inject.hpp">
+      <Filter>Header Files\interfaces</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="stealth_inject.cpp">
+      <Filter>Source Files\interfaces</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <Filter Include="Header Files">

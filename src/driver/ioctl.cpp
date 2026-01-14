@@ -33,6 +33,7 @@ typedef struct _INJECT_IMAGE_CONTEXT
     ULONG ImageSize;
     NTSTATUS Status;
     KEVENT Event;
+    BOOLEAN UseStealthInject; // Use new stealth injection
 
 } INJECT_IMAGE_CONTEXT, *PINJECT_IMAGE_CONTEXT;
 
@@ -43,9 +44,24 @@ static void InjectImageWorkerRoutine(_In_ PVOID param)
 
     auto context = reinterpret_cast<PINJECT_IMAGE_CONTEXT>(param);
 
-    // Attach to process context and inject image
-    //
-    context->Status = Inject::AttachAndInject(context->Process, context->ImageBase, context->ImageSize);
+    // Use stealth injection for Roblox
+    if (context->UseStealthInject)
+    {
+        StealthInject::STEALTH_INJECT_CONFIG config = {};
+        config.UseThreadHijack = TRUE;
+        config.WaitForCompletion = TRUE;
+        config.TimeoutMs = 60000;
+        config.NotificationAddress = nullptr;
+
+        auto result = StealthInject::AttachAndInject(context->Process, context->ImageBase, context->ImageSize, &config);
+        
+        context->Status = (result == StealthInject::INJECT_STATUS::Success) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+    }
+    else
+    {
+        // Legacy injection method
+        context->Status = Inject::AttachAndInject(context->Process, context->ImageBase, context->ImageSize);
+    }
 
     KeSetEvent(&context->Event, IO_NO_INCREMENT, FALSE);
 };
@@ -158,6 +174,7 @@ NTSTATUS HandleIoctl(_In_ PVOID data, _In_ ULONG dataSize)
             imageContext->Process = process;
             imageContext->ImageBase = imageBase;
             imageContext->ImageSize = request->ImageSize;
+            imageContext->UseStealthInject = TRUE; // Use stealth injection by default for Roblox
             KeInitializeEvent(&imageContext->Event, NotificationEvent, FALSE);
             ExInitializeWorkItem(&imageContext->WorkItem, &InjectImageWorkerRoutine, imageContext);
             ExQueueWorkItem(&imageContext->WorkItem, DelayedWorkQueue);

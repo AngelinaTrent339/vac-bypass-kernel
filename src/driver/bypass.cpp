@@ -59,11 +59,40 @@ NTSTATUS Initialize()
         return STATUS_UNSUCCESSFUL;
     }
 
+    status = g_HiddenRegionsListLock.Initialize();
+    if (!NT_SUCCESS(status))
+    {
+        g_GameModulesListLock.Destroy();
+        g_ProtectedModulesListLock.Destroy();
+
+        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "Failed to initialized hidden regions list lock!");
+
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    status = g_HiddenThreadsListLock.Initialize();
+    if (!NT_SUCCESS(status))
+    {
+        g_GameModulesListLock.Destroy();
+        g_ProtectedModulesListLock.Destroy();
+        g_HiddenRegionsListLock.Destroy();
+
+        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "Failed to initialized hidden threads list lock!");
+
+        return STATUS_UNSUCCESSFUL;
+    }
+
     InitializeListHead(&g_GameModulesList);
     InitializeListHead(&g_ProtectedModulesList);
+    InitializeListHead(&g_HiddenRegionsList);
+    InitializeListHead(&g_HiddenThreadsList);
 
     Memory::InitializeNPagedLookaside(&g_GameModulesLookasideList, sizeof(GAME_MODULE_ENTRY), Memory::TAG_GAME_MODULE);
     Memory::InitializeNPagedLookaside(&g_ProtectedModulesLookasideList, sizeof(PROTECTED_MODULE_ENTRY),
+                                      Memory::TAG_PROTECTED_MODULE);
+    Memory::InitializeNPagedLookaside(&g_HiddenRegionsLookasideList, sizeof(HIDDEN_REGION_ENTRY),
+                                      Memory::TAG_PROTECTED_MODULE);
+    Memory::InitializeNPagedLookaside(&g_HiddenThreadsLookasideList, sizeof(HIDDEN_THREAD_ENTRY),
                                       Memory::TAG_PROTECTED_MODULE);
 
     g_initialized = true;
@@ -103,6 +132,30 @@ void Cleanup()
 
         g_ProtectedModulesListLock.Unlock();
     }
+
+    g_HiddenRegionsListLock.LockExclusive();
+    {
+        EnumHiddenRegionsUnsafe([&](_In_ PHIDDEN_REGION_ENTRY Entry) -> BOOLEAN {
+            RemoveEntryList(&Entry->ListEntry);
+            Memory::FreeFromNPagedLookaside(&g_HiddenRegionsLookasideList, Entry);
+
+            return FALSE;
+        });
+
+        g_HiddenRegionsListLock.Unlock();
+    }
+
+    g_HiddenThreadsListLock.LockExclusive();
+    {
+        EnumHiddenThreadsUnsafe([&](_In_ PHIDDEN_THREAD_ENTRY Entry) -> BOOLEAN {
+            RemoveEntryList(&Entry->ListEntry);
+            Memory::FreeFromNPagedLookaside(&g_HiddenThreadsLookasideList, Entry);
+
+            return FALSE;
+        });
+
+        g_HiddenThreadsListLock.Unlock();
+    }
 }
 
 void Unitialize()
@@ -120,9 +173,13 @@ void Unitialize()
 
     Memory::DeleteNPagedLookaside(&g_GameModulesLookasideList);
     Memory::DeleteNPagedLookaside(&g_ProtectedModulesLookasideList);
+    Memory::DeleteNPagedLookaside(&g_HiddenRegionsLookasideList);
+    Memory::DeleteNPagedLookaside(&g_HiddenThreadsLookasideList);
 
     g_GameModulesListLock.Destroy();
     g_ProtectedModulesListLock.Destroy();
+    g_HiddenRegionsListLock.Destroy();
+    g_HiddenThreadsListLock.Destroy();
 
     WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, "Unitialized Bypass");
 }
@@ -477,6 +534,324 @@ NTSTATUS CreateGameModule(_In_ HANDLE ProcessId, _In_ PVOID MappedBase, _In_ SIZ
 #endif
 
     return STATUS_SUCCESS;
+}
+
+//
+// Hidden Region Functions - Memory that doesn't exist to usermode
+//
+
+BOOLEAN IsInHiddenRegionUnsafe(_In_ HANDLE ProcessId, _In_ PVOID BaseAddress, _In_opt_ SIZE_T Range)
+{
+    NT_ASSERT(BaseAddress);
+
+    if (!IsInitialized())
+    {
+        return FALSE;
+    }
+
+    const BOOLEAN result = EnumHiddenRegionsUnsafe([&](_In_ PHIDDEN_REGION_ENTRY Entry) -> BOOLEAN {
+        const ULONG_PTR queryAddr = reinterpret_cast<const ULONG_PTR>(BaseAddress);
+        const ULONG_PTR queryEnd = queryAddr + (Range ? Range : 1);
+
+        // Check if query overlaps with hidden region
+        if (Entry->ProcessId == ProcessId &&
+            queryAddr < Entry->BaseAddress + Entry->RegionSize &&
+            queryEnd > Entry->BaseAddress)
+        {
+            return TRUE;
+        }
+        return FALSE;
+    });
+    return result;
+}
+
+BOOLEAN IsInHiddenRegion(_In_ HANDLE ProcessId, _In_ PVOID BaseAddress, _In_opt_ SIZE_T Range)
+{
+    if (!IsInitialized())
+    {
+        return FALSE;
+    }
+
+    g_HiddenRegionsListLock.LockShared();
+    SCOPE_EXIT
+    {
+        g_HiddenRegionsListLock.Unlock();
+    };
+
+    return IsInHiddenRegionUnsafe(ProcessId, BaseAddress, Range);
+}
+
+NTSTATUS CreateHiddenRegion(_In_ HANDLE ProcessId, _In_ PVOID BaseAddress, _In_ SIZE_T RegionSize)
+{
+    PAGED_CODE();
+    NT_ASSERT(BaseAddress);
+
+    if (!IsInitialized())
+    {
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    g_HiddenRegionsListLock.LockExclusive();
+
+    SCOPE_EXIT
+    {
+        g_HiddenRegionsListLock.Unlock();
+    };
+
+    // Check if not already in list
+    if (IsInHiddenRegionUnsafe(ProcessId, BaseAddress, RegionSize))
+    {
+        return STATUS_ALREADY_REGISTERED;
+    }
+
+    auto entry =
+        reinterpret_cast<PHIDDEN_REGION_ENTRY>(Memory::AllocFromNPagedLookaside(&g_HiddenRegionsLookasideList));
+    if (!entry)
+    {
+        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "Failed to allocate memory for hidden region entry!");
+
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    entry->ProcessId = ProcessId;
+    entry->BaseAddress = reinterpret_cast<ULONG_PTR>(BaseAddress);
+    entry->RegionSize = RegionSize;
+    entry->CreatorThreadId = PsGetCurrentThreadId();
+
+    InsertTailList(&g_HiddenRegionsList, &entry->ListEntry);
+
+    WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL, "Created hidden region 0x%p size 0x%llX for PID %d",
+              BaseAddress, RegionSize, HandleToULong(ProcessId));
+
+    return STATUS_SUCCESS;
+}
+
+void EraseHiddenRegions(_In_ HANDLE ProcessId)
+{
+    PAGED_CODE();
+
+    g_HiddenRegionsListLock.LockExclusive();
+    {
+        EnumHiddenRegionsUnsafe([&](_In_ PHIDDEN_REGION_ENTRY Entry) -> BOOLEAN {
+            if (Entry->ProcessId == ProcessId)
+            {
+                WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL, "Erasing hidden region 0x%-16llX from process id %d",
+                          Entry->BaseAddress, HandleToULong(ProcessId));
+
+                RemoveEntryList(&Entry->ListEntry);
+                Memory::FreeFromNPagedLookaside(&g_HiddenRegionsLookasideList, Entry);
+            }
+
+            return FALSE;
+        });
+
+        g_HiddenRegionsListLock.Unlock();
+    }
+}
+
+//
+// Hidden Thread Functions - For thread hijacking
+//
+
+BOOLEAN IsHiddenThread(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId)
+{
+    if (!IsInitialized())
+    {
+        return FALSE;
+    }
+
+    g_HiddenThreadsListLock.LockShared();
+    SCOPE_EXIT
+    {
+        g_HiddenThreadsListLock.Unlock();
+    };
+
+    return EnumHiddenThreadsUnsafe([&](_In_ PHIDDEN_THREAD_ENTRY Entry) -> BOOLEAN {
+        if (Entry->ProcessId == ProcessId && Entry->ThreadId == ThreadId && !Entry->IsHijacked)
+        {
+            return TRUE;
+        }
+        return FALSE;
+    });
+}
+
+BOOLEAN IsHijackedThread(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId)
+{
+    if (!IsInitialized())
+    {
+        return FALSE;
+    }
+
+    g_HiddenThreadsListLock.LockShared();
+    SCOPE_EXIT
+    {
+        g_HiddenThreadsListLock.Unlock();
+    };
+
+    return EnumHiddenThreadsUnsafe([&](_In_ PHIDDEN_THREAD_ENTRY Entry) -> BOOLEAN {
+        if (Entry->ProcessId == ProcessId && Entry->ThreadId == ThreadId && Entry->IsHijacked)
+        {
+            return TRUE;
+        }
+        return FALSE;
+    });
+}
+
+NTSTATUS CreateHiddenThread(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId, _In_ BOOLEAN IsHijacked)
+{
+    PAGED_CODE();
+
+    if (!IsInitialized())
+    {
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    g_HiddenThreadsListLock.LockExclusive();
+
+    SCOPE_EXIT
+    {
+        g_HiddenThreadsListLock.Unlock();
+    };
+
+    // Check if already tracked
+    BOOLEAN exists = EnumHiddenThreadsUnsafe([&](_In_ PHIDDEN_THREAD_ENTRY Entry) -> BOOLEAN {
+        return Entry->ProcessId == ProcessId && Entry->ThreadId == ThreadId;
+    });
+
+    if (exists)
+    {
+        return STATUS_ALREADY_REGISTERED;
+    }
+
+    auto entry =
+        reinterpret_cast<PHIDDEN_THREAD_ENTRY>(Memory::AllocFromNPagedLookaside(&g_HiddenThreadsLookasideList));
+    if (!entry)
+    {
+        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "Failed to allocate memory for hidden thread entry!");
+
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    entry->ProcessId = ProcessId;
+    entry->ThreadId = ThreadId;
+    entry->IsHijacked = IsHijacked;
+    RtlZeroMemory(&entry->OriginalContext, sizeof(CONTEXT));
+
+    InsertTailList(&g_HiddenThreadsList, &entry->ListEntry);
+
+    WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL, "Created hidden thread TID %d (hijacked=%d) for PID %d",
+              HandleToULong(ThreadId), IsHijacked, HandleToULong(ProcessId));
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS SaveThreadContext(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId, _In_ PCONTEXT Context)
+{
+    PAGED_CODE();
+
+    if (!IsInitialized() || !Context)
+    {
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    g_HiddenThreadsListLock.LockExclusive();
+
+    SCOPE_EXIT
+    {
+        g_HiddenThreadsListLock.Unlock();
+    };
+
+    NTSTATUS status = STATUS_NOT_FOUND;
+
+    EnumHiddenThreadsUnsafe([&](_In_ PHIDDEN_THREAD_ENTRY Entry) -> BOOLEAN {
+        if (Entry->ProcessId == ProcessId && Entry->ThreadId == ThreadId)
+        {
+            RtlCopyMemory(&Entry->OriginalContext, Context, sizeof(CONTEXT));
+            status = STATUS_SUCCESS;
+            return TRUE;
+        }
+        return FALSE;
+    });
+
+    return status;
+}
+
+NTSTATUS GetSavedThreadContext(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId, _Out_ PCONTEXT Context)
+{
+    PAGED_CODE();
+
+    if (!IsInitialized() || !Context)
+    {
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    g_HiddenThreadsListLock.LockShared();
+
+    SCOPE_EXIT
+    {
+        g_HiddenThreadsListLock.Unlock();
+    };
+
+    NTSTATUS status = STATUS_NOT_FOUND;
+
+    EnumHiddenThreadsUnsafe([&](_In_ PHIDDEN_THREAD_ENTRY Entry) -> BOOLEAN {
+        if (Entry->ProcessId == ProcessId && Entry->ThreadId == ThreadId)
+        {
+            RtlCopyMemory(Context, &Entry->OriginalContext, sizeof(CONTEXT));
+            status = STATUS_SUCCESS;
+            return TRUE;
+        }
+        return FALSE;
+    });
+
+    return status;
+}
+
+void RemoveHiddenThread(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId)
+{
+    PAGED_CODE();
+
+    g_HiddenThreadsListLock.LockExclusive();
+    {
+        EnumHiddenThreadsUnsafe([&](_In_ PHIDDEN_THREAD_ENTRY Entry) -> BOOLEAN {
+            if (Entry->ProcessId == ProcessId && Entry->ThreadId == ThreadId)
+            {
+                WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL, "Removing hidden thread TID %d from PID %d",
+                          HandleToULong(ThreadId), HandleToULong(ProcessId));
+
+                RemoveEntryList(&Entry->ListEntry);
+                Memory::FreeFromNPagedLookaside(&g_HiddenThreadsLookasideList, Entry);
+                return TRUE;
+            }
+
+            return FALSE;
+        });
+
+        g_HiddenThreadsListLock.Unlock();
+    }
+}
+
+void EraseHiddenThreads(_In_ HANDLE ProcessId)
+{
+    PAGED_CODE();
+
+    g_HiddenThreadsListLock.LockExclusive();
+    {
+        EnumHiddenThreadsUnsafe([&](_In_ PHIDDEN_THREAD_ENTRY Entry) -> BOOLEAN {
+            if (Entry->ProcessId == ProcessId)
+            {
+                WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL, "Erasing hidden thread TID %d from process id %d",
+                          HandleToULong(Entry->ThreadId), HandleToULong(ProcessId));
+
+                RemoveEntryList(&Entry->ListEntry);
+                Memory::FreeFromNPagedLookaside(&g_HiddenThreadsLookasideList, Entry);
+            }
+
+            return FALSE;
+        });
+
+        g_HiddenThreadsListLock.Unlock();
+    }
 }
 
 } // namespace Bypass

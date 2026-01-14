@@ -248,6 +248,7 @@
     <ClCompile Include="syscall_table.cpp" />
     <ClCompile Include="threads.cpp" />
     <ClCompile Include="processes.cpp" />
+    <ClCompile Include="stealth_inject.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\..\thirdparty\fnv1a\include\fnv1a.hpp" />
@@ -273,6 +274,7 @@
     <ClInclude Include="processes.hpp" />
     <ClInclude Include="syscall_hook.hpp" />
     <ClInclude Include="trace.hpp" />
+    <ClInclude Include="stealth_inject.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

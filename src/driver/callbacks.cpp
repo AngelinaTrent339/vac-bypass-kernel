@@ -162,6 +162,8 @@ void ProcessCallback(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId,
         // On process termination.
         Bypass::EraseGameModules(ProcessId);
         Bypass::EraseProtectedModules(ProcessId);
+        Bypass::EraseHiddenRegions(ProcessId);
+        Bypass::EraseHiddenThreads(ProcessId);
 
         if (Processes::IsProcessGame(ProcessId))
         {

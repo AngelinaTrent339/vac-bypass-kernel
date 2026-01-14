@@ -80,6 +80,24 @@ PFN_NtSetInformationThread oNtSetInformationThread = nullptr;
 typedef NTSTATUS(NTAPI *PFN_NtClose)(_In_ HANDLE Handle);
 PFN_NtClose oNtClose = nullptr;
 
+// Thread context manipulation - for thread hijacking
+typedef NTSTATUS(NTAPI *PFN_NtGetContextThread)(_In_ HANDLE ThreadHandle, _Inout_ PCONTEXT ThreadContext);
+PFN_NtGetContextThread oNtGetContextThread = nullptr;
+
+typedef NTSTATUS(NTAPI *PFN_NtSetContextThread)(_In_ HANDLE ThreadHandle, _In_ PCONTEXT ThreadContext);
+PFN_NtSetContextThread oNtSetContextThread = nullptr;
+
+typedef NTSTATUS(NTAPI *PFN_NtSuspendThread)(_In_ HANDLE ThreadHandle, _Out_opt_ PULONG PreviousSuspendCount);
+PFN_NtSuspendThread oNtSuspendThread = nullptr;
+
+typedef NTSTATUS(NTAPI *PFN_NtResumeThread)(_In_ HANDLE ThreadHandle, _Out_opt_ PULONG PreviousSuspendCount);
+PFN_NtResumeThread oNtResumeThread = nullptr;
+
+typedef NTSTATUS(NTAPI *PFN_NtAllocateVirtualMemory)(_In_ HANDLE ProcessHandle, _Inout_ PVOID *BaseAddress,
+                                                      _In_ ULONG_PTR ZeroBits, _Inout_ PSIZE_T RegionSize,
+                                                      _In_ ULONG AllocationType, _In_ ULONG Protect);
+PFN_NtAllocateVirtualMemory oNtAllocateVirtualMemory = nullptr;
+
 void __fastcall SsdtCallback(ULONG ServiceIndex, PVOID *ServiceAddress)
 {
     for (SYSCALL_HOOK_ENTRY &Entry : g_SyscallHookList)
@@ -200,6 +218,22 @@ hkNtQueryVirtualMemory(_In_ HANDLE ProcessHandle, _In_opt_ PVOID BaseAddress,
     const HANDLE currentPid = PsGetCurrentProcessId();
     const HANDLE targetPid = Misc::GetProcessIDFromProcessHandle(ProcessHandle);
 
+    // For hidden regions: block ALL usermode queries - memory doesn't exist
+    // This applies to ANY process querying our hidden memory (including Roblox itself / Hyperion)
+    if (GetPreviousMode() == UserMode && g_shouldBypass && BaseAddress)
+    {
+        // Check if querying a hidden region - return as if memory doesn't exist
+        if (Bypass::IsInHiddenRegion(targetPid, BaseAddress))
+        {
+            WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL, "[STEALTH] Blocking query to hidden region 0x%p from PID %d",
+                      BaseAddress, HandleToULong(currentPid));
+
+            // Return STATUS_INVALID_ADDRESS - memory doesn't exist
+            return STATUS_INVALID_ADDRESS;
+        }
+    }
+
+    // Original VAC bypass logic for protected modules
     if (GetPreviousMode() != UserMode || !g_shouldBypass ||
         !Processes::IsProcessSteam(currentPid) && !Processes::IsProcessGame(targetPid))
     {
@@ -216,30 +250,7 @@ hkNtQueryVirtualMemory(_In_ HANDLE ProcessHandle, _In_opt_ PVOID BaseAddress,
             WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL, "[VAC Q1]");
 #endif
 
-#if 0
-				auto mbi = reinterpret_cast<PMEMORY_BASIC_INFORMATION>(MemoryInformation);
-
-				PVOID nextBase = reinterpret_cast<PBYTE>(mbi->BaseAddress) + mbi->RegionSize;
-
-				SIZE_T nextLength = 0;
-				MEMORY_BASIC_INFORMATION nextBlock = {};
-
-				oNtQueryVirtualMemory(ProcessHandle, nextBase, MemoryInformationClass, &nextBlock, sizeof(nextBlock),
-					&nextLength);
-
-				mbi->AllocationBase = nullptr;
-				mbi->AllocationProtect = 0;
-				mbi->State = MEM_FREE;
-				mbi->Protect = PAGE_NOACCESS;
-				mbi->Type = 0;
-
-				if (nextBlock.State == MEM_FREE)
-				{
-					mbi->RegionSize += nextBlock.RegionSize;
-				}
-#else
             return STATUS_ACCESS_VIOLATION;
-#endif
         }
     }
 Exit:
@@ -260,16 +271,41 @@ NTSTATUS NTAPI hkNtReadVirtualMemory(HANDLE ProcessHandle, PVOID BaseAddress, PV
 
     const HANDLE currentPid = PsGetCurrentProcessId();
     const HANDLE targetPid = Misc::GetProcessIDFromProcessHandle(ProcessHandle);
+    NTSTATUS status;
 
-    // Check if bypass is enabled and if requestor process is Steam and requested process is game
-    //
+    // STEALTH: Block ALL reads to hidden regions from ANY usermode process
+    // Hyperion cannot hash what it cannot read
+    if (GetPreviousMode() == UserMode && g_shouldBypass && BaseAddress)
+    {
+        if (Bypass::IsInHiddenRegion(targetPid, BaseAddress, NumberOfBytesToRead))
+        {
+            WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL, "[STEALTH] Blocking read to hidden region 0x%p size 0x%llX from PID %d",
+                      BaseAddress, NumberOfBytesToRead, HandleToULong(currentPid));
+
+            __try
+            {
+                if (NumberOfBytesReaded)
+                {
+                    ProbeForWrite(NumberOfBytesReaded, sizeof(*NumberOfBytesReaded), alignof(PVOID));
+                    *NumberOfBytesReaded = 0;
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                return GetExceptionCode();
+            }
+
+            // Memory doesn't exist - cannot be read
+            return STATUS_PARTIAL_COPY;
+        }
+    }
+
+    // Original VAC bypass logic
     if (GetPreviousMode() != UserMode || !g_shouldBypass ||
         !(Processes::IsProcessSteam(currentPid) && Processes::IsProcessGame(targetPid)))
     {
         return oNtReadVirtualMemory(ProcessHandle, BaseAddress, Buffer, NumberOfBytesToRead, NumberOfBytesReaded);
     }
-
-    NTSTATUS status;
 
     if (Bypass::IsInProtectedModuleMemoryRange(targetPid, nullptr, BaseAddress, NumberOfBytesToRead))
     {
@@ -553,6 +589,78 @@ NTSTATUS NTAPI hkNtQuerySystemInformation(IN SYSTEM_INFORMATION_CLASS SystemInfo
         }
         default:
             break;
+        }
+    }
+
+    // STEALTH: Filter hidden threads from SystemProcessInformation
+    // This runs for ALL usermode callers when bypass is enabled
+    if (GetPreviousMode() == UserMode && g_shouldBypass && NT_SUCCESS(Status) && SystemInformation)
+    {
+        if (SystemInformationClass == SystemProcessInformation)
+        {
+            __try
+            {
+                ProbeForWrite(SystemInformation, SystemInformationLength, 1);
+
+                auto processInfo = reinterpret_cast<PSYSTEM_PROCESS_INFORMATION>(SystemInformation);
+
+                while (processInfo)
+                {
+                    const HANDLE processPid = processInfo->UniqueProcessId;
+
+                    // Filter threads for this process
+                    if (processInfo->NumberOfThreads > 0)
+                    {
+                        auto threadInfo = reinterpret_cast<PSYSTEM_THREAD_INFORMATION>(
+                            reinterpret_cast<PUCHAR>(processInfo) + sizeof(SYSTEM_PROCESS_INFORMATION));
+
+                        ULONG originalThreadCount = processInfo->NumberOfThreads;
+                        ULONG filteredCount = 0;
+
+                        // Compact the thread array, removing hidden threads
+                        for (ULONG i = 0; i < originalThreadCount; i++)
+                        {
+                            HANDLE threadId = threadInfo[i].ClientId.UniqueThread;
+
+                            // Check if this thread should be hidden
+                            if (!Bypass::IsHiddenThread(processPid, threadId))
+                            {
+                                // Keep this thread - copy to filtered position if needed
+                                if (filteredCount != i)
+                                {
+                                    RtlCopyMemory(&threadInfo[filteredCount], &threadInfo[i],
+                                                  sizeof(SYSTEM_THREAD_INFORMATION));
+                                }
+                                filteredCount++;
+                            }
+                            else
+                            {
+                                WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL,
+                                          "[STEALTH] Hiding thread TID %d from PID %d",
+                                          HandleToULong(threadId), HandleToULong(processPid));
+                            }
+                        }
+
+                        // Update thread count
+                        processInfo->NumberOfThreads = filteredCount;
+                    }
+
+                    // Move to next process
+                    if (processInfo->NextEntryOffset == 0)
+                    {
+                        break;
+                    }
+
+                    processInfo = reinterpret_cast<PSYSTEM_PROCESS_INFORMATION>(
+                        reinterpret_cast<PUCHAR>(processInfo) + processInfo->NextEntryOffset);
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL,
+                          "Exception filtering threads from SystemProcessInformation: %!STATUS!",
+                          GetExceptionCode());
+            }
         }
     }
 
@@ -860,6 +968,151 @@ NTSTATUS NTAPI hkNtSetInformationThread(_In_ HANDLE ThreadHandle, _In_ THREADINF
 //=============================================================================
 // NtClose Hook - Prevent invalid handle anti-debug trick
 //=============================================================================
+// Thread Context Manipulation Hooks - For Thread Hijacking Injection
+//=============================================================================
+
+NTSTATUS NTAPI hkNtGetContextThread(_In_ HANDLE ThreadHandle, _Inout_ PCONTEXT ThreadContext)
+{
+    InterlockedIncrement(&g_hooksRefCount);
+    SCOPE_EXIT
+    {
+        InterlockedDecrement(&g_hooksRefCount);
+    };
+
+    const HANDLE currentPid = PsGetCurrentProcessId();
+
+    // Get target thread info
+    PETHREAD thread = nullptr;
+    NTSTATUS status = ObReferenceObjectByHandle(ThreadHandle, THREAD_GET_CONTEXT, *PsThreadType,
+                                                 GetPreviousMode(), reinterpret_cast<PVOID *>(&thread), nullptr);
+    
+    if (NT_SUCCESS(status))
+    {
+        HANDLE targetPid = PsGetThreadProcessId(thread);
+        HANDLE targetTid = PsGetThreadId(thread);
+        ObDereferenceObject(thread);
+
+        // If this is a hijacked thread and someone OTHER than us is querying context,
+        // return the saved original context (spoof the hijack)
+        if (GetPreviousMode() == UserMode && g_shouldBypass)
+        {
+            if (Bypass::IsHijackedThread(targetPid, targetTid))
+            {
+                CONTEXT savedContext = {};
+                if (NT_SUCCESS(Bypass::GetSavedThreadContext(targetPid, targetTid, &savedContext)))
+                {
+                    __try
+                    {
+                        ProbeForWrite(ThreadContext, sizeof(CONTEXT), alignof(CONTEXT));
+                        
+                        // Only copy fields that were requested
+                        ULONG contextFlags = ThreadContext->ContextFlags;
+                        RtlCopyMemory(ThreadContext, &savedContext, sizeof(CONTEXT));
+                        ThreadContext->ContextFlags = contextFlags;
+
+                        WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL,
+                                  "[STEALTH] Spoofing context for hijacked thread TID %d",
+                                  HandleToULong(targetTid));
+
+                        return STATUS_SUCCESS;
+                    }
+                    __except (EXCEPTION_EXECUTE_HANDLER)
+                    {
+                        return GetExceptionCode();
+                    }
+                }
+            }
+        }
+    }
+
+    return oNtGetContextThread(ThreadHandle, ThreadContext);
+}
+
+NTSTATUS NTAPI hkNtSetContextThread(_In_ HANDLE ThreadHandle, _In_ PCONTEXT ThreadContext)
+{
+    InterlockedIncrement(&g_hooksRefCount);
+    SCOPE_EXIT
+    {
+        InterlockedDecrement(&g_hooksRefCount);
+    };
+
+    // Allow all context sets - we control this
+    return oNtSetContextThread(ThreadHandle, ThreadContext);
+}
+
+NTSTATUS NTAPI hkNtSuspendThread(_In_ HANDLE ThreadHandle, _Out_opt_ PULONG PreviousSuspendCount)
+{
+    InterlockedIncrement(&g_hooksRefCount);
+    SCOPE_EXIT
+    {
+        InterlockedDecrement(&g_hooksRefCount);
+    };
+
+    // Allow all thread suspends - we control this
+    return oNtSuspendThread(ThreadHandle, PreviousSuspendCount);
+}
+
+NTSTATUS NTAPI hkNtResumeThread(_In_ HANDLE ThreadHandle, _Out_opt_ PULONG PreviousSuspendCount)
+{
+    InterlockedIncrement(&g_hooksRefCount);
+    SCOPE_EXIT
+    {
+        InterlockedDecrement(&g_hooksRefCount);
+    };
+
+    // Allow all thread resumes - we control this
+    return oNtResumeThread(ThreadHandle, PreviousSuspendCount);
+}
+
+//=============================================================================
+// NtAllocateVirtualMemory Hook - Track allocations for stealth injection
+//=============================================================================
+
+// Global flag to indicate next allocation should be hidden
+inline thread_local bool g_nextAllocationHidden = false;
+inline thread_local HANDLE g_nextAllocationPid = nullptr;
+
+void SetNextAllocationHidden(HANDLE ProcessId)
+{
+    g_nextAllocationHidden = true;
+    g_nextAllocationPid = ProcessId;
+}
+
+NTSTATUS NTAPI hkNtAllocateVirtualMemory(_In_ HANDLE ProcessHandle, _Inout_ PVOID *BaseAddress,
+                                          _In_ ULONG_PTR ZeroBits, _Inout_ PSIZE_T RegionSize,
+                                          _In_ ULONG AllocationType, _In_ ULONG Protect)
+{
+    InterlockedIncrement(&g_hooksRefCount);
+    SCOPE_EXIT
+    {
+        InterlockedDecrement(&g_hooksRefCount);
+    };
+
+    NTSTATUS status = oNtAllocateVirtualMemory(ProcessHandle, BaseAddress, ZeroBits, RegionSize,
+                                                AllocationType, Protect);
+
+    // If this allocation was marked as hidden, register it
+    if (NT_SUCCESS(status) && g_nextAllocationHidden && BaseAddress && *BaseAddress && RegionSize && *RegionSize)
+    {
+        HANDLE targetPid = g_nextAllocationPid;
+        if (!targetPid)
+        {
+            targetPid = Misc::GetProcessIDFromProcessHandle(ProcessHandle);
+        }
+
+        Bypass::CreateHiddenRegion(targetPid, *BaseAddress, *RegionSize);
+
+        WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL, "[STEALTH] Allocated hidden region 0x%p size 0x%llX for PID %d",
+                  *BaseAddress, *RegionSize, HandleToULong(targetPid));
+
+        g_nextAllocationHidden = false;
+        g_nextAllocationPid = nullptr;
+    }
+
+    return status;
+}
+
+//=============================================================================
 NTSTATUS NTAPI hkNtClose(_In_ HANDLE Handle)
 {
     InterlockedIncrement(&g_hooksRefCount);
@@ -935,6 +1188,12 @@ NTSTATUS Initialize()
     CREATE_HOOK(NtQueryInformationProcess);
     CREATE_HOOK(NtSetInformationThread);
     CREATE_HOOK(NtClose);
+    // Thread hijacking hooks
+    CREATE_HOOK(NtGetContextThread);
+    CREATE_HOOK(NtSetContextThread);
+    CREATE_HOOK(NtSuspendThread);
+    CREATE_HOOK(NtResumeThread);
+    CREATE_HOOK(NtAllocateVirtualMemory);
 
 #undef CREATE_HOOK
 

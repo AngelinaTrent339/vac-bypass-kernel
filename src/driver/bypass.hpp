@@ -60,6 +60,37 @@ inline NPAGED_LOOKASIDE_LIST g_ProtectedModulesLookasideList{};
 inline LIST_ENTRY g_ProtectedModulesList{};
 inline Mutex::Resource g_ProtectedModulesListLock;
 
+// Hidden regions - completely invisible to usermode (memory doesn't exist)
+// Used for stealth injection where even query returns STATUS_INVALID_ADDRESS
+typedef struct _HIDDEN_REGION_ENTRY
+{
+    LIST_ENTRY ListEntry;
+    HANDLE ProcessId;
+    ULONG_PTR BaseAddress;
+    SIZE_T RegionSize;
+    HANDLE CreatorThreadId;  // Thread that created this region (for thread hijack tracking)
+
+} HIDDEN_REGION_ENTRY, *PHIDDEN_REGION_ENTRY;
+
+inline NPAGED_LOOKASIDE_LIST g_HiddenRegionsLookasideList{};
+inline LIST_ENTRY g_HiddenRegionsList{};
+inline Mutex::Resource g_HiddenRegionsListLock;
+
+// Hidden threads - threads we create/hijack that should be invisible
+typedef struct _HIDDEN_THREAD_ENTRY
+{
+    LIST_ENTRY ListEntry;
+    HANDLE ProcessId;
+    HANDLE ThreadId;
+    BOOLEAN IsHijacked;      // TRUE if this is a hijacked thread (don't hide, but spoof context)
+    CONTEXT OriginalContext; // Saved context for hijacked threads
+
+} HIDDEN_THREAD_ENTRY, *PHIDDEN_THREAD_ENTRY;
+
+inline NPAGED_LOOKASIDE_LIST g_HiddenThreadsLookasideList{};
+inline LIST_ENTRY g_HiddenThreadsList{};
+inline Mutex::Resource g_HiddenThreadsListLock;
+
 [[nodiscard]] NTSTATUS Initialize();
 void Unitialize();
 
@@ -140,4 +171,82 @@ template <typename C = ENUM_PROTECTED_MODULES> __forceinline BOOLEAN EnumProtect
     }
     return result;
 }
+
+// Enumeration helpers for hidden regions
+using ENUM_HIDDEN_REGIONS = BOOLEAN (*)(_In_ PHIDDEN_REGION_ENTRY);
+using ENUM_HIDDEN_THREADS = BOOLEAN (*)(_In_ PHIDDEN_THREAD_ENTRY);
+
+template <typename C = ENUM_HIDDEN_REGIONS> __forceinline BOOLEAN EnumHiddenRegionsUnsafe(_In_ const C &Callback)
+{
+    NT_ASSERT(CURRENT_IRQL <= DISPATCH_LEVEL);
+
+    LIST_ENTRY *listHead = &g_HiddenRegionsList;
+
+    if (IsListEmpty(listHead))
+    {
+        return FALSE;
+    }
+
+    PHIDDEN_REGION_ENTRY entry = nullptr;
+    LIST_ENTRY *listEntry = listHead->Flink;
+    BOOLEAN result = FALSE;
+
+    while (listEntry != listHead)
+    {
+        entry = CONTAINING_RECORD(listEntry, HIDDEN_REGION_ENTRY, ListEntry);
+        listEntry = listEntry->Flink;
+
+        if (Callback(entry))
+        {
+            result = TRUE;
+            break;
+        }
+    }
+    return result;
+}
+
+template <typename C = ENUM_HIDDEN_THREADS> __forceinline BOOLEAN EnumHiddenThreadsUnsafe(_In_ const C &Callback)
+{
+    NT_ASSERT(CURRENT_IRQL <= DISPATCH_LEVEL);
+
+    LIST_ENTRY *listHead = &g_HiddenThreadsList;
+
+    if (IsListEmpty(listHead))
+    {
+        return FALSE;
+    }
+
+    PHIDDEN_THREAD_ENTRY entry = nullptr;
+    LIST_ENTRY *listEntry = listHead->Flink;
+    BOOLEAN result = FALSE;
+
+    while (listEntry != listHead)
+    {
+        entry = CONTAINING_RECORD(listEntry, HIDDEN_THREAD_ENTRY, ListEntry);
+        listEntry = listEntry->Flink;
+
+        if (Callback(entry))
+        {
+            result = TRUE;
+            break;
+        }
+    }
+    return result;
+}
+
+// Hidden region functions - memory that doesn't exist to usermode
+[[nodiscard]] NTSTATUS CreateHiddenRegion(_In_ HANDLE ProcessId, _In_ PVOID BaseAddress, _In_ SIZE_T RegionSize);
+[[nodiscard]] BOOLEAN IsInHiddenRegion(_In_ HANDLE ProcessId, _In_ PVOID BaseAddress, _In_opt_ SIZE_T Range = 0ULL);
+[[nodiscard]] BOOLEAN IsInHiddenRegionUnsafe(_In_ HANDLE ProcessId, _In_ PVOID BaseAddress, _In_opt_ SIZE_T Range = 0ULL);
+void EraseHiddenRegions(_In_ HANDLE ProcessId);
+
+// Hidden thread functions - for thread hijacking
+[[nodiscard]] NTSTATUS CreateHiddenThread(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId, _In_ BOOLEAN IsHijacked);
+[[nodiscard]] NTSTATUS SaveThreadContext(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId, _In_ PCONTEXT Context);
+[[nodiscard]] NTSTATUS GetSavedThreadContext(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId, _Out_ PCONTEXT Context);
+[[nodiscard]] BOOLEAN IsHiddenThread(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId);
+[[nodiscard]] BOOLEAN IsHijackedThread(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId);
+void RemoveHiddenThread(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId);
+void EraseHiddenThreads(_In_ HANDLE ProcessId);
+
 } // namespace Bypass
