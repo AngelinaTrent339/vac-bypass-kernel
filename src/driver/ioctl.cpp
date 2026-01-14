@@ -59,7 +59,6 @@ static void InjectImageWorkerRoutine(_In_ PVOID param)
         KERNEL_LOG_INFO("Using StealthInject method...");
 
         StealthInject::STEALTH_INJECT_CONFIG config = {};
-        config.UseThreadHijack = TRUE;
         config.WaitForCompletion = TRUE;
         config.TimeoutMs = 60000;
         config.NotificationAddress = nullptr;

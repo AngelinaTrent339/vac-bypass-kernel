@@ -69,13 +69,11 @@ typedef struct _HIJACK_CONTEXT
     ULONG64 pGetProcAddress;         // 0x158: kernel32!GetProcAddress
     ULONG64 pNtFlushInstructionCache;// 0x160: ntdll!NtFlushInstructionCache
     ULONG64 pLdrpHandleTlsData;      // 0x168: ntdll!LdrpHandleTlsData (optional)
-    ULONG64 pRtlExitUserThread;      // 0x170: ntdll!RtlExitUserThread (required for non-hijack)
-    ULONG64 IsHijackedThread;        // 0x178: 1 = hijacked (restore & return), 0 = new thread (exit)
 
 } HIJACK_CONTEXT, *PHIJACK_CONTEXT;
 #pragma pack(pop)
 
-static_assert(sizeof(HIJACK_CONTEXT) == 0x180, "HIJACK_CONTEXT size mismatch with ASM");
+static_assert(sizeof(HIJACK_CONTEXT) == 0x170, "HIJACK_CONTEXT size mismatch with ASM");
 
 //------------------------------------------------------------------------------
 // Extern declarations for the assembled shellcode
