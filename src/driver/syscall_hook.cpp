@@ -1258,17 +1258,28 @@ NTSTATUS InitializeAltSyscallHook()
     DBG_PRINT("[AltSyscall] Descriptor table filled, writing to PspServiceDescriptorGroupTable...");
     
     // Write our row to PspServiceDescriptorGroupTable
-    // Disable CR0.WP to allow writing to read-only kernel memory
-    // NOTE: This will NOT work if HVCI is enabled!
+    // Must disable CET before disabling WP (CR0.WP cannot be cleared when CR4.CET=1)
+    // CR4.CET = bit 23 (0x800000)
+    // CR0.WP = bit 16 (0x10000)
     
     KIRQL oldIrql = KeRaiseIrqlToDpcLevel();
+    
+    // Save and disable CET first (required before we can clear WP)
+    ULONG_PTR cr4 = __readcr4();
+    if (cr4 & 0x800000)  // If CET is enabled
+    {
+        __writecr4(cr4 & ~0x800000);  // Clear CET bit
+        _mm_lfence();
+    }
+    
+    // Now we can safely disable WP
     ULONG_PTR cr0 = __readcr0();
     __writecr0(cr0 & ~0x10000);  // Clear WP bit (bit 16)
     _mm_lfence();
     
     __try
     {
-        DBG_PRINT("[AltSyscall] CR0.WP disabled, writing...");
+        DBG_PRINT("[AltSyscall] CET/WP disabled, writing...");
         g_PspServiceDescriptorGroupTable->Rows[ALT_SYSCALL_SLOT_ID].DriverBase = g_DriverBase;
         g_PspServiceDescriptorGroupTable->Rows[ALT_SYSCALL_SLOT_ID].DispatchTable = g_AltSyscallDispatchTable;
         g_PspServiceDescriptorGroupTable->Rows[ALT_SYSCALL_SLOT_ID].Reserved = nullptr;
@@ -1276,19 +1287,21 @@ NTSTATUS InitializeAltSyscallHook()
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
-        // Restore CR0.WP before returning
+        // Restore CR0.WP and CR4.CET before returning
         __writecr0(cr0);
+        __writecr4(cr4);
         KeLowerIrql(oldIrql);
         
         WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, 
-                  "Exception writing to PspServiceDescriptorGroupTable - HVCI may be blocking writes!");
+                  "Exception writing to PspServiceDescriptorGroupTable!");
         Memory::FreePool(g_AltSyscallDispatchTable);
         g_AltSyscallDispatchTable = nullptr;
         return STATUS_ACCESS_VIOLATION;
     }
     
-    // Restore CR0.WP
+    // Restore CR0.WP first, then CR4.CET
     __writecr0(cr0);
+    __writecr4(cr4);
     KeLowerIrql(oldIrql);
     
     DBG_PRINT("[AltSyscall] Installed dispatch table at slot %u", ALT_SYSCALL_SLOT_ID);
