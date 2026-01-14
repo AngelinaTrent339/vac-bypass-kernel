@@ -844,69 +844,110 @@ ULONG64 __fastcall AltSyscallHandler(
 // ============================================================================
 
 /// Find PspServiceDescriptorGroupTable by pattern scanning
-/// The pattern is found in PsSyscallProviderDispatch
+/// Based on Hells-Hollow approach: find PsSyscallProviderDispatch function first
 PVOID FindPspServiceDescriptorGroupTable()
 {
-    // Pattern for finding reference to PspServiceDescriptorGroupTable in PsSyscallProviderDispatch
-    // This will vary between Windows builds!
+    DBG_PRINT("[AltSyscall] Searching for PsSyscallProviderDispatch function...");
     
-    // Search in ntoskrnl for "PsSyscallProviderDispatch" and find LEA instruction
-    // that references PspServiceDescriptorGroupTable
+    // Pattern for PsSyscallProviderDispatch function prologue (from Hells-Hollow)
+    // This is the function start, not a reference to the table
+    const UCHAR PsSyscallProviderDispatchPattern[] = {
+        0x48, 0x89, 0x5c, 0x24, 0x08,  // mov qword ptr [rsp+8], rbx
+        0x55,                           // push rbp
+        0x56,                           // push rsi
+        0x57,                           // push rdi
+        0x41, 0x56,                     // push r14
+        0x41, 0x57,                     // push r15
+        0x48, 0x83, 0xec, 0x30,         // sub rsp, 30h
+        0x48, 0x83, 0x64, 0x24, 0x70, 0x00,  // and qword ptr [rsp+70h], 0
+        0x48, 0x8b, 0xf1,               // mov rsi, rcx
+        0x65, 0x48, 0x8b, 0x2c, 0x25, 0x88, 0x01, 0x00, 0x00,  // mov rbp, gs:[188h]
+        0xf6, 0x45, 0x03, 0x04          // test byte ptr [rbp+3], 4
+    };
     
-    // Pattern: 4C 8D 05 ?? ?? ?? ?? (lea r8, [rip+offset])
-    // This is followed by indexing into the table
-    
-    DBG_PRINT("[AltSyscall] Searching for pattern in PAGE section...");
-    
-    const PUCHAR Pattern = Misc::Memory::FindPattern(
-        NTOS_BASE, 
-        "PAGE",  // Usually in PAGE section
-        "48 8B 05 ?? ?? ?? ?? "  // mov rax, [PspServiceDescriptorGroupTable]
-        "48 6B ?? 18"            // imul reg, reg, 0x18 (size of each row)
-    );
-    
-    DBG_PRINT("[AltSyscall] Pattern result: 0x%p", Pattern);
-    
-    if (!Pattern)
+    // Search in ntoskrnl
+    PIMAGE_NT_HEADERS64 nth = RtlImageNtHeader(NTOS_BASE);
+    if (!nth)
     {
-        DBG_PRINT("[AltSyscall] First pattern failed, trying .text section...");
-        
-        // Try alternate pattern
-        const PUCHAR AltPattern = Misc::Memory::FindPattern(
-            NTOS_BASE,
-            ".text",
-            "4C 8D 05 ?? ?? ?? ?? "  // lea r8, [PspServiceDescriptorGroupTable]
-            "49 8B 04 C0"            // mov rax, [r8+rax*8]
-        );
-        
-        DBG_PRINT("[AltSyscall] Alt pattern result: 0x%p", AltPattern);
-        
-        if (AltPattern)
-        {
-            PVOID resolved = RipToAbsolute<PVOID>(reinterpret_cast<ULONG_PTR>(AltPattern), 3, 7);
-            DBG_PRINT("[AltSyscall] Resolved address from alt pattern: 0x%p", resolved);
-            return resolved;
-        }
-        
+        DBG_PRINT("[AltSyscall] Failed to get NT headers");
         return nullptr;
     }
     
-    PVOID resolved = RipToAbsolute<PVOID>(reinterpret_cast<ULONG_PTR>(Pattern), 3, 7);
-    DBG_PRINT("[AltSyscall] Resolved address from pattern: 0x%p", resolved);
+    PUCHAR BaseAddress = reinterpret_cast<PUCHAR>(NTOS_BASE);
+    ULONG ImageSize = nth->OptionalHeader.SizeOfImage;
     
-    // Dump first few bytes at the resolved address to verify
-    if (MmIsAddressValid(resolved))
+    DBG_PRINT("[AltSyscall] Scanning ntoskrnl at 0x%p, size 0x%X", BaseAddress, ImageSize);
+    
+    PUCHAR FunctionAddress = nullptr;
+    for (ULONG i = 0; i < ImageSize - sizeof(PsSyscallProviderDispatchPattern); i++)
     {
-        PUCHAR ptr = reinterpret_cast<PUCHAR>(resolved);
-        DBG_PRINT("[AltSyscall] First 24 bytes at resolved addr: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
-            ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5], ptr[6], ptr[7],
-            ptr[8], ptr[9], ptr[10], ptr[11], ptr[12], ptr[13], ptr[14], ptr[15],
-            ptr[16], ptr[17], ptr[18], ptr[19], ptr[20], ptr[21], ptr[22], ptr[23]);
+        if (RtlCompareMemory(BaseAddress + i, PsSyscallProviderDispatchPattern, 
+                             sizeof(PsSyscallProviderDispatchPattern)) == sizeof(PsSyscallProviderDispatchPattern))
+        {
+            FunctionAddress = BaseAddress + i;
+            break;
+        }
     }
-    else
+    
+    if (!FunctionAddress)
     {
-        DBG_PRINT("[AltSyscall] WARNING: Resolved address 0x%p is NOT VALID!", resolved);
+        DBG_PRINT("[AltSyscall] Could not find PsSyscallProviderDispatch pattern!");
+        return nullptr;
     }
+    
+    DBG_PRINT("[AltSyscall] Found PsSyscallProviderDispatch at 0x%p", FunctionAddress);
+    
+    // The instruction at offset 0x77 from function start references PspServiceDescriptorGroupTable
+    // It's a "mov rax, [rip+disp32]" instruction (48 8B 05 xx xx xx xx)
+    PUCHAR InstructionAddress = FunctionAddress + 0x77;
+    
+    DBG_PRINT("[AltSyscall] Instruction address: 0x%p", InstructionAddress);
+    DBG_PRINT("[AltSyscall] Bytes at instruction: %02X %02X %02X %02X %02X %02X %02X",
+              InstructionAddress[0], InstructionAddress[1], InstructionAddress[2],
+              InstructionAddress[3], InstructionAddress[4], InstructionAddress[5], InstructionAddress[6]);
+    
+    // Verify it's a mov instruction (48 8B 05 = mov rax, [rip+disp32])
+    if (InstructionAddress[0] != 0x48 || InstructionAddress[1] != 0x8B || InstructionAddress[2] != 0x05)
+    {
+        DBG_PRINT("[AltSyscall] WARNING: Expected 48 8B 05 instruction at offset 0x77!");
+        // Try to find it nearby
+        for (int offset = 0x70; offset < 0x90; offset++)
+        {
+            PUCHAR probe = FunctionAddress + offset;
+            if (probe[0] == 0x48 && probe[1] == 0x8B && probe[2] == 0x05)
+            {
+                DBG_PRINT("[AltSyscall] Found 48 8B 05 at offset 0x%X", offset);
+                InstructionAddress = probe;
+                break;
+            }
+        }
+    }
+    
+    // Read the 32-bit displacement (little-endian, at offset 3)
+    INT32 disp32 = *reinterpret_cast<INT32*>(InstructionAddress + 3);
+    // RIP-relative addressing: address = next_instruction + displacement
+    PVOID resolved = reinterpret_cast<PVOID>(InstructionAddress + 7 + disp32);
+    
+    DBG_PRINT("[AltSyscall] disp32 = 0x%08X, resolved = 0x%p", disp32, resolved);
+    
+    // Validate the address
+    if (!MmIsAddressValid(resolved))
+    {
+        DBG_PRINT("[AltSyscall] Resolved address is NOT VALID!");
+        return nullptr;
+    }
+    
+    // Dump first 48 bytes (2 rows) to verify structure
+    PUCHAR ptr = reinterpret_cast<PUCHAR>(resolved);
+    DBG_PRINT("[AltSyscall] First 48 bytes at table:");
+    DBG_PRINT("[AltSyscall] Row0: %016llX %016llX %016llX",
+              *reinterpret_cast<PULONG64>(ptr),
+              *reinterpret_cast<PULONG64>(ptr + 8),
+              *reinterpret_cast<PULONG64>(ptr + 16));
+    DBG_PRINT("[AltSyscall] Row1: %016llX %016llX %016llX",
+              *reinterpret_cast<PULONG64>(ptr + 24),
+              *reinterpret_cast<PULONG64>(ptr + 32),
+              *reinterpret_cast<PULONG64>(ptr + 40));
     
     return resolved;
 }
