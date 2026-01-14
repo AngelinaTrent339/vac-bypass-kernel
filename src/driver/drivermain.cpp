@@ -131,6 +131,15 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     WPP_INIT_TRACING(DriverObject, RegistryPath);
 
+    // Initialize kernel log buffer FIRST (must be at PASSIVE_LEVEL)
+    status = KernelLog::Initialize();
+    if (!NT_SUCCESS(status))
+    {
+        DBG_PRINT("KernelLog::Initialize failed, error 0x%08X", status);
+        goto Exit;
+    }
+    KERNEL_LOG_INFO("Kernel log buffer initialized");
+
     status = IoCreateDevice(DriverObject, 0, &g_deviceName, FILE_DEVICE_UNKNOWN, 0, FALSE, &g_deviceObject);
     if (!NT_SUCCESS(status))
     {
