@@ -73,6 +73,9 @@ NTSTATUS EnableAltSyscallForThread(_In_ PETHREAD Thread);
 // Disables Alt Syscall for a specific thread
 NTSTATUS DisableAltSyscallForThread(_In_ PETHREAD Thread);
 
+// Configures EPROCESS for alt syscalls (sets the Slot field)
+void ConfigureProcessForAltSyscall(_In_ PETHREAD Thread);
+
 // Enables Alt Syscall for all threads in a process
 NTSTATUS EnableAltSyscallForProcess(_In_ PEPROCESS Process);
 

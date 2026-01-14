@@ -173,10 +173,10 @@ void ProcessCallback(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId,
 #if (SYSCALL_HOOK_TYPE == SYSCALL_HOOK_ALT_SYSCALL)
 void ThreadCallback(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId, _In_ BOOLEAN Create)
 {
-    UNREFERENCED_PARAMETER(ThreadId);
+    UNREFERENCED_PARAMETER(ProcessId);
     
-    // Only handle thread creation in game processes
-    if (!Create || !Processes::IsProcessGame(ProcessId))
+    // Only handle thread creation
+    if (!Create)
     {
         return;
     }
@@ -192,25 +192,12 @@ void ThreadCallback(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId, _In_ BOOLEAN Cr
     NTSTATUS status = PsLookupThreadByThreadId(ThreadId, &Thread);
     if (!NT_SUCCESS(status))
     {
-        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, 
-                  "PsLookupThreadByThreadId failed for tid %d: %!STATUS!", 
-                  HandleToULong(ThreadId), status);
         return;
     }
     
-    // Enable Alt Syscall for this new thread
-    status = SyscallHook::EnableAltSyscallForThread(Thread);
-    if (!NT_SUCCESS(status))
-    {
-        WPP_PRINT(TRACE_LEVEL_WARNING, GENERAL, 
-                  "Failed to enable AltSyscall for new thread %d: %!STATUS!", 
-                  HandleToULong(ThreadId), status);
-    }
-    else
-    {
-        DBG_PRINT("[AltSyscall] Enabled for new thread %d in game process %d", 
-                  HandleToULong(ThreadId), HandleToULong(ProcessId));
-    }
+    // Enable Alt Syscall for ALL new threads (for system-wide code integrity spoofing)
+    SyscallHook::EnableAltSyscallForThread(Thread);
+    SyscallHook::ConfigureProcessForAltSyscall(Thread);
     
     ObDereferenceObject(Thread);
 }
