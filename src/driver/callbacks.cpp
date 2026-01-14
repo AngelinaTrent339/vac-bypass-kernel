@@ -96,8 +96,6 @@ void Unitialize()
 void ProcessCallback(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId,
                      _Inout_opt_ PPS_CREATE_NOTIFY_INFO CreateNotifyInfo)
 {
-    UNREFERENCED_PARAMETER(Process);
-
     static bool gameFound = false;
 
     if (CreateNotifyInfo)
@@ -115,19 +113,9 @@ void ProcessCallback(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId,
 
         if (RtlSuffixUnicodeString(&robloxPlayer, CreateNotifyInfo->ImageFileName, TRUE) && !gameFound)
         {
-            gameFound = true;
-
-            WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, "Adding image %wZ (%d) to game list",
-                      CreateNotifyInfo->ImageFileName, HandleToULong(ProcessId));
-
-            status = Processes::AddProcessGame(ProcessId);
-            if (!NT_SUCCESS(status))
-            {
-                WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "AddProcessGame returned %!STATUS!", status);
-            }
-
 #if (SYSCALL_HOOK_TYPE == SYSCALL_HOOK_ALT_SYSCALL)
-            // Enable Alt Syscall for Roblox process
+            // CRITICAL: Enable Alt Syscall FIRST before anything else runs!
+            // This must happen before DllMain of any DLL (including anti-cheat)
             if (SyscallHook::g_AltSyscallRegistered)
             {
                 status = SyscallHook::EnableAltSyscallForProcess(Process);
@@ -138,11 +126,21 @@ void ProcessCallback(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId,
                 }
                 else
                 {
-                    WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, 
-                              "Alt Syscall enabled for Roblox process %d", HandleToULong(ProcessId));
+                    DBG_PRINT("[AltSyscall] Enabled for Roblox process %d BEFORE any code execution", 
+                              HandleToULong(ProcessId));
                 }
             }
 #endif
+            gameFound = true;
+
+            WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, "Adding Roblox %wZ (%d) to game list",
+                      CreateNotifyInfo->ImageFileName, HandleToULong(ProcessId));
+
+            status = Processes::AddProcessGame(ProcessId);
+            if (!NT_SUCCESS(status))
+            {
+                WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "AddProcessGame returned %!STATUS!", status);
+            }
         }
     }
     else
@@ -173,10 +171,8 @@ void ProcessCallback(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId,
 #if (SYSCALL_HOOK_TYPE == SYSCALL_HOOK_ALT_SYSCALL)
 void ThreadCallback(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId, _In_ BOOLEAN Create)
 {
-    UNREFERENCED_PARAMETER(ProcessId);
-    
-    // Only handle thread creation
-    if (!Create)
+    // Only handle thread creation in Roblox process
+    if (!Create || !Processes::IsProcessGame(ProcessId))
     {
         return;
     }
@@ -195,7 +191,7 @@ void ThreadCallback(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId, _In_ BOOLEAN Cr
         return;
     }
     
-    // Enable Alt Syscall for ALL new threads (for system-wide code integrity spoofing)
+    // Enable Alt Syscall for new threads in Roblox (for code integrity spoofing)
     SyscallHook::EnableAltSyscallForThread(Thread);
     SyscallHook::ConfigureProcessForAltSyscall(Thread);
     
