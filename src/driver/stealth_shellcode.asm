@@ -62,7 +62,8 @@ CTX_pLoadLibraryA       EQU 150h
 CTX_pGetProcAddress     EQU 158h
 CTX_pNtFlushInstructionCache EQU 160h
 CTX_pLdrpHandleTlsData  EQU 168h
-CTX_pRtlAddVectoredExceptionHandler EQU 170h
+CTX_pRtlExitUserThread  EQU 170h
+CTX_IsHijackedThread    EQU 178h
 
 ;------------------------------------------------------------------------------
 ; HijackShellcodeV2
@@ -294,7 +295,13 @@ done:
     mov     eax, 1
     xchg    dword ptr [rbx + CTX_Completed], eax
     
-    ; === Epilogue: Restore everything and return to hijacked location ===
+    ; === Check if this is a hijacked thread or a new thread ===
+    ; Hijacked thread: restore all registers and return to OriginalRip
+    ; New thread: call RtlExitUserThread(0) to terminate cleanly
+    cmp     qword ptr [rbx + CTX_IsHijackedThread], 0
+    je      exit_thread
+    
+    ; === Epilogue for HIJACKED thread: Restore everything and return ===
     
     ; First restore XMM from context (need RBX for addressing)
     ; Use movups (unaligned) for safety
@@ -338,6 +345,17 @@ done:
     
     ; Return to original execution point
     ret
+
+exit_thread:
+    ; === Epilogue for NEW thread: Exit cleanly ===
+    ; This thread was created by RtlCreateUserThread, not hijacked
+    ; We cannot restore original context (there is none)
+    ; Call RtlExitUserThread(0) to terminate
+    
+    ; RtlExitUserThread(NTSTATUS ExitStatus)
+    xor     ecx, ecx                    ; arg1 = 0 (STATUS_SUCCESS)
+    mov     rax, [rbx + CTX_pRtlExitUserThread]
+    jmp     rax                         ; Tail call - does not return
 
 HijackShellcodeV2 ENDP
 

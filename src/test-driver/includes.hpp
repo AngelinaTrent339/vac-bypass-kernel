@@ -26,8 +26,11 @@
 #include <cstdio>
 #include <fstream>
 #include <iostream>
+#include <sstream>
+#include <iomanip>
 #include <vector>
 #include <thread>
+#include <chrono>
 #include <filesystem>
 
 #include <phnt_windows.h>

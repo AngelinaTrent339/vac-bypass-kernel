@@ -581,13 +581,13 @@ INJECT_STATUS InjectDll(
     PVOID GetProcAddress = Misc::PE::GetProcAddress(kernel32Entry->DllBase, "GetProcAddress");
     PVOID NtFlushInstructionCache = Misc::PE::GetProcAddress(ntdllEntry->DllBase, "NtFlushInstructionCache");
     
+    // Required for non-hijack thread termination
+    PVOID RtlExitUserThread = Misc::PE::GetProcAddress(ntdllEntry->DllBase, "RtlExitUserThread");
+    
     // Optional TLS support
     PVOID LdrpHandleTlsData = Misc::PE::GetProcAddress(ntdllEntry->DllBase, "LdrpHandleTlsData");
-    
-    // Optional VEH support
-    PVOID RtlAddVectoredExceptionHandler = Misc::PE::GetProcAddress(ntdllEntry->DllBase, "RtlAddVectoredExceptionHandler");
 
-    if (!LoadLibraryA || !GetProcAddress)
+    if (!LoadLibraryA || !GetProcAddress || !RtlExitUserThread)
     {
         WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "Failed to find required exports!");
         return INJECT_STATUS::ModuleNotFound;
@@ -622,10 +622,12 @@ INJECT_STATUS InjectDll(
     hijackContext->pLoadLibraryA = reinterpret_cast<ULONG64>(LoadLibraryA);
     hijackContext->pGetProcAddress = reinterpret_cast<ULONG64>(GetProcAddress);
     hijackContext->pNtFlushInstructionCache = reinterpret_cast<ULONG64>(NtFlushInstructionCache);
+    hijackContext->pRtlExitUserThread = reinterpret_cast<ULONG64>(RtlExitUserThread);
     
     // Function pointers (optional)
     hijackContext->pLdrpHandleTlsData = reinterpret_cast<ULONG64>(LdrpHandleTlsData);
-    hijackContext->pRtlAddVectoredExceptionHandler = reinterpret_cast<ULONG64>(RtlAddVectoredExceptionHandler);
+    
+    // IsHijackedThread will be set later based on injection method
 
     // === Copy shellcode from kernel to usermode hidden memory ===
     SIZE_T shellcodeSize = StealthShellcode::GetShellcodeSize();
@@ -656,6 +658,9 @@ INJECT_STATUS InjectDll(
 
     if (Config->UseThreadHijack)
     {
+        // Mark as hijacked thread - shellcode will restore context and return
+        hijackContext->IsHijackedThread = 1;
+        
         // Find a suitable thread to hijack
         PETHREAD targetThread = nullptr;
         status = FindHijackableThread(TargetProcess, &targetThread);
@@ -687,6 +692,9 @@ INJECT_STATUS InjectDll(
     }
     else
     {
+        // Mark as new thread - shellcode will call RtlExitUserThread when done
+        hijackContext->IsHijackedThread = 0;
+        
         // Create a new hidden thread with RtlCreateUserThread
         HANDLE threadHandle = nullptr;
         CLIENT_ID clientId = {};
