@@ -275,6 +275,7 @@
     <ClInclude Include="syscall_hook.hpp" />
     <ClInclude Include="trace.hpp" />
     <ClInclude Include="stealth_inject.hpp" />
+    <ClInclude Include="stealth_shellcode.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

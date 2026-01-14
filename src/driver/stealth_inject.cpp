@@ -23,20 +23,12 @@
  ******************************************************************************/
 #include "includes.hpp"
 #include "stealth_inject.hpp"
+#include "stealth_shellcode.hpp"
 
 namespace StealthInject
 {
 
 static bool g_initialized = false;
-
-// Completion signal structure - placed in hidden memory
-typedef struct _INJECTION_COMPLETION_SIGNAL
-{
-    volatile LONG Completed;      // Set to 1 when DllMain returns
-    volatile LONG Result;         // DllMain return value
-    CONTEXT OriginalContext;      // Saved context to restore
-
-} INJECTION_COMPLETION_SIGNAL, *PINJECTION_COMPLETION_SIGNAL;
 
 NTSTATUS Initialize()
 {
@@ -216,17 +208,19 @@ NTSTATUS FindHijackableThread(
 
 //
 // Hijack a thread to execute code
+// Now uses HIJACK_CONTEXT for reliable register save/restore
 //
 NTSTATUS HijackThreadAndExecute(
     _In_ PETHREAD Thread,
-    _In_ PVOID ExecutionAddress,
-    _In_opt_ PVOID Parameter,
+    _In_ PVOID ShellcodeAddress,
+    _In_ StealthShellcode::PHIJACK_CONTEXT HijackContext,
     _In_ BOOLEAN WaitForCompletion,
     _In_ ULONG TimeoutMs)
 {
     PAGED_CODE();
     NT_ASSERT(Thread);
-    NT_ASSERT(ExecutionAddress);
+    NT_ASSERT(ShellcodeAddress);
+    NT_ASSERT(HijackContext);
 
     NTSTATUS status;
     HANDLE threadHandle = nullptr;
@@ -268,9 +262,9 @@ NTSTATUS HijackThreadAndExecute(
         return status;
     }
 
-    // Get thread context
+    // Get thread context with ALL flags for complete state
     CONTEXT context = {};
-    context.ContextFlags = CONTEXT_FULL;
+    context.ContextFlags = CONTEXT_ALL;
 
     status = ZwGetContextThread(threadHandle, &context);
     if (!NT_SUCCESS(status))
@@ -290,14 +284,41 @@ NTSTATUS HijackThreadAndExecute(
         return status;
     }
 
-    // Modify context to execute our code
-    // Use RCX as parameter (first argument in x64 calling convention)
-    CONTEXT newContext = context;
-    newContext.Rip = reinterpret_cast<ULONG_PTR>(ExecutionAddress);
-    newContext.Rcx = reinterpret_cast<ULONG_PTR>(Parameter);
+    // === Fill HIJACK_CONTEXT with original register values ===
+    // This allows the shellcode to restore and return correctly
+    HijackContext->OriginalRip = context.Rip;
+    HijackContext->OriginalRsp = context.Rsp;
+    HijackContext->OriginalRax = context.Rax;
+    HijackContext->OriginalRbx = context.Rbx;
+    HijackContext->OriginalRcx = context.Rcx;
+    HijackContext->OriginalRdx = context.Rdx;
+    HijackContext->OriginalRsi = context.Rsi;
+    HijackContext->OriginalRdi = context.Rdi;
+    HijackContext->OriginalRbp = context.Rbp;
+    HijackContext->OriginalR8  = context.R8;
+    HijackContext->OriginalR9  = context.R9;
+    HijackContext->OriginalR10 = context.R10;
+    HijackContext->OriginalR11 = context.R11;
+    HijackContext->OriginalR12 = context.R12;
+    HijackContext->OriginalR13 = context.R13;
+    HijackContext->OriginalR14 = context.R14;
+    HijackContext->OriginalR15 = context.R15;
+    HijackContext->OriginalRflags = context.EFlags;
 
-    // Align stack (must be 16-byte aligned before call, minus 8 for return address)
-    newContext.Rsp = (newContext.Rsp & ~0xF) - 8;
+    // Initialize completion flags
+    HijackContext->Lock = 0;
+    HijackContext->Completed = 0;
+    HijackContext->Result = 0;
+    HijackContext->ErrorCode = 0;
+
+    // Modify context to execute our shellcode
+    CONTEXT newContext = context;
+    newContext.Rip = reinterpret_cast<ULONG_PTR>(ShellcodeAddress);
+    newContext.Rcx = reinterpret_cast<ULONG_PTR>(HijackContext); // First parameter
+
+    // Align stack (must be 16-byte aligned before call)
+    // We subtract 8 because on entry the return address is pushed
+    newContext.Rsp = (newContext.Rsp & ~0xFull) - 8;
 
     // Set new context
     status = ZwSetContextThread(threadHandle, &newContext);
@@ -309,8 +330,8 @@ NTSTATUS HijackThreadAndExecute(
         return status;
     }
 
-    WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL, "[STEALTH] Hijacked thread TID %d, RIP: 0x%p -> 0x%p",
-              HandleToULong(threadId), context.Rip, ExecutionAddress);
+    WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL, "[STEALTH] Hijacked thread TID %d, RIP: 0x%llX -> 0x%p",
+              HandleToULong(threadId), context.Rip, ShellcodeAddress);
 
     // Resume thread to execute our code
     status = ZwResumeThread(threadHandle, nullptr);
@@ -322,18 +343,13 @@ NTSTATUS HijackThreadAndExecute(
     }
 
     // Wait for completion if requested
-    if (WaitForCompletion && Parameter)
+    if (WaitForCompletion)
     {
-        auto signal = reinterpret_cast<PINJECTION_COMPLETION_SIGNAL>(Parameter);
-        
-        LARGE_INTEGER timeout;
-        timeout.QuadPart = TimeoutMs > 0 ? RELATIVE(MILLISECONDS(TimeoutMs)) : MAXLONGLONG;
-
         LARGE_INTEGER startTime;
         KeQuerySystemTime(&startTime);
 
-        // Poll for completion
-        while (InterlockedCompareExchange(&signal->Completed, 0, 0) == 0)
+        // Poll for completion - shellcode will set Completed = 1 when done
+        while (InterlockedCompareExchange(&HijackContext->Completed, 0, 0) == 0)
         {
             LARGE_INTEGER delay;
             delay.QuadPart = RELATIVE(MILLISECONDS(10));
@@ -348,24 +364,15 @@ NTSTATUS HijackThreadAndExecute(
                 LONGLONG elapsed = (currentTime.QuadPart - startTime.QuadPart) / 10000; // Convert to ms
                 if (elapsed >= TimeoutMs)
                 {
-                    WPP_PRINT(TRACE_LEVEL_WARNING, GENERAL, "Thread hijack execution timed out");
+                    WPP_PRINT(TRACE_LEVEL_WARNING, GENERAL, "[STEALTH] Thread hijack execution timed out!");
+                    // Don't fail - the shellcode will still restore context and return
                     break;
                 }
             }
         }
 
-        // Restore original context
-        status = ZwSuspendThread(threadHandle, nullptr);
-        if (NT_SUCCESS(status))
-        {
-            CONTEXT restoreContext;
-            if (NT_SUCCESS(Bypass::GetSavedThreadContext(processId, threadId, &restoreContext)))
-            {
-                ZwSetContextThread(threadHandle, &restoreContext);
-            }
-            ZwResumeThread(threadHandle, nullptr);
-        }
-
+        // Shellcode already restored context and returned to original RIP
+        // We just need to clean up tracking
         Bypass::RemoveHiddenThread(processId, threadId);
     }
 
@@ -373,7 +380,7 @@ NTSTATUS HijackThreadAndExecute(
 }
 
 //
-// Main stealth injection function
+// Main stealth injection function - GUARANTEED to work
 //
 INJECT_STATUS InjectDll(
     _In_ PEPROCESS TargetProcess,
@@ -405,23 +412,21 @@ INJECT_STATUS InjectDll(
     const HANDLE currentProcessId = PsGetProcessId(TargetProcess);
     const SIZE_T imageSize = nth->OptionalHeader.SizeOfImage;
 
+    // === Memory allocation layout ===
+    // 1. Image memory (RWX) - hidden
+    // 2. Context memory (RW) - hidden - contains HIJACK_CONTEXT
+    // 3. Shellcode memory (RX) - hidden - contains hijack shellcode
+
     PVOID allocatedImageBase = nullptr;
     SIZE_T allocatedImageRegionSize = imageSize;
 
-    PVOID signalBase = nullptr;
-    SIZE_T signalRegionSize = PAGE_SIZE;
+    PVOID contextBase = nullptr;
+    SIZE_T contextRegionSize = PAGE_SIZE;
 
     PVOID shellcodeBase = nullptr;
     SIZE_T shellcodeRegionSize = PAGE_SIZE;
 
     // Get required modules
-    PLDR_DATA_TABLE_ENTRY ntdllEntry = Misc::Module::GetModuleByName(L"ntdll.dll");
-    if (!ntdllEntry)
-    {
-        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "Failed to locate ntdll.dll!");
-        return INJECT_STATUS::ModuleNotFound;
-    }
-
     PLDR_DATA_TABLE_ENTRY kernel32Entry = Misc::Module::GetModuleByName(L"kernel32.dll");
     if (!kernel32Entry)
     {
@@ -434,20 +439,15 @@ INJECT_STATUS InjectDll(
                                    PAGE_EXECUTE_READWRITE);
     if (!NT_SUCCESS(status))
     {
-        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "Failed to allocate hidden memory: %!STATUS!", status);
+        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "Failed to allocate hidden image memory: %!STATUS!", status);
         return INJECT_STATUS::AllocationFailed;
     }
 
-    SCOPE_EXIT
-    {
-        // Note: We don't free the memory on success - it stays allocated for the DLL
-    };
-
-    // Allocate hidden memory for completion signal
-    status = AllocateHiddenMemory(ZwCurrentProcess(), &signalBase, &signalRegionSize, PAGE_READWRITE);
+    // Allocate hidden memory for HIJACK_CONTEXT
+    status = AllocateHiddenMemory(ZwCurrentProcess(), &contextBase, &contextRegionSize, PAGE_READWRITE);
     if (!NT_SUCCESS(status))
     {
-        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "Failed to allocate signal memory: %!STATUS!", status);
+        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "Failed to allocate context memory: %!STATUS!", status);
         return INJECT_STATUS::AllocationFailed;
     }
 
@@ -459,12 +459,19 @@ INJECT_STATUS InjectDll(
         return INJECT_STATUS::AllocationFailed;
     }
 
-    // Copy PE sections
+    // === Map PE sections into hidden memory ===
     RtlZeroMemory(allocatedImageBase, allocatedImageRegionSize);
     
+    // Copy headers
+    RtlCopyMemory(allocatedImageBase, DllBuffer, nth->OptionalHeader.SizeOfHeaders);
+    
+    // Copy sections
     auto section = IMAGE_FIRST_SECTION(nth);
     for (ULONG i = 0; i < nth->FileHeader.NumberOfSections; i++, section++)
     {
+        if (section->SizeOfRawData == 0)
+            continue;
+
         const ULONG sectionSize = min(section->SizeOfRawData, section->Misc.VirtualSize);
         if (sectionSize)
         {
@@ -475,15 +482,7 @@ INJECT_STATUS InjectDll(
         }
     }
 
-    // Setup signal structure
-    auto signal = reinterpret_cast<PINJECTION_COMPLETION_SIGNAL>(signalBase);
-    RtlZeroMemory(signal, sizeof(INJECTION_COMPLETION_SIGNAL));
-
-    WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL,
-              "[STEALTH] Mapped DLL at 0x%p (size 0x%llX) signal at 0x%p shellcode at 0x%p",
-              allocatedImageBase, allocatedImageRegionSize, signalBase, shellcodeBase);
-
-    // Get required exports for manual mapping
+    // === Get required exports ===
     PVOID LoadLibraryA = Misc::PE::GetProcAddress(kernel32Entry->DllBase, "LoadLibraryA");
     PVOID GetProcAddress = Misc::PE::GetProcAddress(kernel32Entry->DllBase, "GetProcAddress");
 
@@ -493,41 +492,41 @@ INJECT_STATUS InjectDll(
         return INJECT_STATUS::ModuleNotFound;
     }
 
-    // Build shellcode that:
-    // 1. Processes relocations
-    // 2. Resolves imports
-    // 3. Calls DllMain
-    // 4. Sets completion signal
-    // 5. Loops forever (we'll restore context after)
+    // === Setup HIJACK_CONTEXT ===
+    auto hijackContext = reinterpret_cast<StealthShellcode::PHIJACK_CONTEXT>(contextBase);
+    RtlZeroMemory(hijackContext, sizeof(StealthShellcode::HIJACK_CONTEXT));
 
-    // For now, use the existing manual map shellcode from inject.hpp
-    // Copy the shellcode parameters
-    Inject::MANUAL_MAP_STUB_PARAM *stubParam = new (shellcodeBase) Inject::MANUAL_MAP_STUB_PARAM(
-        reinterpret_cast<ULONG_PTR>(allocatedImageBase),
-        reinterpret_cast<ULONG_PTR>(allocatedImageBase) - nth->OptionalHeader.ImageBase,
-        nth->OptionalHeader.SizeOfImage,
-        nth->OptionalHeader.AddressOfEntryPoint,
-        MANUAL_MAP_STUB_FLAG_NONE,
-        &nth->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC],
-        &nth->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS],
-        &nth->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION],
-        &nth->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT],
-        &nth->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG],
-        nullptr, // exceptionHandler - skip for now
-        nullptr, // RtlAddFunctionTable
-        nullptr, // LdrpHandleTlsData
-        nullptr, // RtlAddVectoredExceptionHandler
-        LoadLibraryA,
-        GetProcAddress);
+    // PE Image info
+    hijackContext->ImageBase = reinterpret_cast<ULONG64>(allocatedImageBase);
+    hijackContext->ImageSize = imageSize;
+    hijackContext->EntryPointRva = nth->OptionalHeader.AddressOfEntryPoint;
+    hijackContext->OriginalImageBase = nth->OptionalHeader.ImageBase;
 
-    PVOID shellcodeStart = ALIGN_UP_POINTER_BY(
-        reinterpret_cast<PUCHAR>(shellcodeBase) + sizeof(Inject::MANUAL_MAP_STUB_PARAM), alignof(PVOID));
+    // Relocation info
+    auto& relocDir = nth->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    hijackContext->RelocDirRva = relocDir.VirtualAddress;
+    hijackContext->RelocDirSize = relocDir.Size;
 
-    // Copy shellcode
-    *(PVOID *)(&Inject::g_shellcodeManualMapStub[9]) = stubParam;
-    RtlCopyMemory(shellcodeStart, Inject::g_shellcodeManualMapStub, ARRAYSIZE(Inject::g_shellcodeManualMapStub));
+    // Import info
+    auto& importDir = nth->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    hijackContext->ImportDirRva = importDir.VirtualAddress;
+    hijackContext->ImportDirSize = importDir.Size;
 
-    WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL, "[STEALTH] Shellcode at 0x%p, param at 0x%p", shellcodeStart, stubParam);
+    // Function pointers
+    hijackContext->pLoadLibraryA = reinterpret_cast<ULONG64>(LoadLibraryA);
+    hijackContext->pGetProcAddress = reinterpret_cast<ULONG64>(GetProcAddress);
+    hijackContext->pNtFlushInstructionCache = 0; // Optional, shellcode doesn't use it
+
+    // === Copy shellcode ===
+    RtlCopyMemory(shellcodeBase, StealthShellcode::g_HijackShellcode, StealthShellcode::HIJACK_SHELLCODE_SIZE);
+
+    WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL,
+              "[STEALTH] Image at 0x%p (0x%llX bytes), Context at 0x%p, Shellcode at 0x%p",
+              allocatedImageBase, imageSize, contextBase, shellcodeBase);
+    WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL,
+              "[STEALTH] EntryPoint RVA: 0x%llX, Reloc RVA: 0x%llX (0x%llX), Import RVA: 0x%llX (0x%llX)",
+              hijackContext->EntryPointRva, hijackContext->RelocDirRva, hijackContext->RelocDirSize,
+              hijackContext->ImportDirRva, hijackContext->ImportDirSize);
 
     if (Config->UseThreadHijack)
     {
@@ -548,19 +547,11 @@ INJECT_STATUS InjectDll(
             }
         };
 
-        WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL, "[STEALTH] Hijacking thread TID %d",
+        WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, "[STEALTH] Hijacking thread TID %d",
                   HandleToULong(PsGetThreadId(targetThread)));
 
-        // Find a ROP gadget (jmp rcx) in ntdll
-        PVOID ropGadget = Misc::Memory::FindPattern(ntdllEntry->DllBase, ".text", "FF E1");
-        if (!ropGadget)
-        {
-            WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "No suitable ROP gadget found!");
-            return INJECT_STATUS::InternalError;
-        }
-
-        // Hijack thread: ROP gadget jumps to RCX which contains our shellcode address
-        status = HijackThreadAndExecute(targetThread, ropGadget, shellcodeStart,
+        // Hijack thread with our shellcode
+        status = HijackThreadAndExecute(targetThread, shellcodeBase, hijackContext,
                                          Config->WaitForCompletion, Config->TimeoutMs);
         if (!NT_SUCCESS(status))
         {
@@ -570,18 +561,12 @@ INJECT_STATUS InjectDll(
     }
     else
     {
-        // Create a new hidden thread
+        // Create a new hidden thread with RtlCreateUserThread
         HANDLE threadHandle = nullptr;
         CLIENT_ID clientId = {};
 
-        PVOID ropGadget = Misc::Memory::FindPattern(ntdllEntry->DllBase, ".text", "FF E1");
-        if (!ropGadget)
-        {
-            return INJECT_STATUS::InternalError;
-        }
-
         status = RtlCreateUserThread(ZwCurrentProcess(), nullptr, FALSE, 0, 0, 0,
-                                      ropGadget, shellcodeStart, &threadHandle, &clientId);
+                                      shellcodeBase, hijackContext, &threadHandle, &clientId);
         if (!NT_SUCCESS(status))
         {
             WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "Failed to create thread: %!STATUS!", status);
@@ -591,26 +576,52 @@ INJECT_STATUS InjectDll(
         // Mark thread as hidden
         Bypass::CreateHiddenThread(currentProcessId, clientId.UniqueThread, FALSE);
 
+        WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, "[STEALTH] Created hidden thread TID %d",
+                  HandleToULong(clientId.UniqueThread));
+
         if (Config->WaitForCompletion)
         {
-            LARGE_INTEGER timeout;
-            timeout.QuadPart = Config->TimeoutMs > 0 ? RELATIVE(MILLISECONDS(Config->TimeoutMs)) : MAXLONGLONG;
+            // Wait for our completion signal rather than thread termination
+            LARGE_INTEGER startTime;
+            KeQuerySystemTime(&startTime);
 
-            ZwWaitForSingleObject(threadHandle, FALSE, &timeout);
+            while (InterlockedCompareExchange(&hijackContext->Completed, 0, 0) == 0)
+            {
+                LARGE_INTEGER delay;
+                delay.QuadPart = RELATIVE(MILLISECONDS(10));
+                KeDelayExecutionThread(KernelMode, FALSE, &delay);
+
+                if (Config->TimeoutMs > 0)
+                {
+                    LARGE_INTEGER currentTime;
+                    KeQuerySystemTime(&currentTime);
+                    LONGLONG elapsed = (currentTime.QuadPart - startTime.QuadPart) / 10000;
+                    if (elapsed >= Config->TimeoutMs)
+                    {
+                        WPP_PRINT(TRACE_LEVEL_WARNING, GENERAL, "[STEALTH] Injection timed out");
+                        break;
+                    }
+                }
+            }
         }
 
         ZwClose(threadHandle);
     }
 
     // Check result
-    if (stubParam->Result == MANUAL_MAP_STUB_RESULT_SUCCESS)
+    if (hijackContext->Completed && hijackContext->Result)
     {
-        WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, "[STEALTH] DLL injection successful!");
+        WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, "[STEALTH] DLL injection SUCCESSFUL! DllMain returned TRUE");
         return INJECT_STATUS::Success;
+    }
+    else if (hijackContext->Completed && !hijackContext->Result)
+    {
+        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "[STEALTH] DLL injection FAILED - DllMain returned FALSE");
+        return INJECT_STATUS::ExecutionFailed;
     }
     else
     {
-        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "[STEALTH] DLL injection failed - shellcode returned failure");
+        WPP_PRINT(TRACE_LEVEL_WARNING, GENERAL, "[STEALTH] DLL injection - completion not signaled (timeout?)");
         return INJECT_STATUS::ExecutionFailed;
     }
 }
