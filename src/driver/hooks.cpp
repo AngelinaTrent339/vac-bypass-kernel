@@ -361,6 +361,7 @@ NTSTATUS NTAPI hkNtQuerySystemInformation(IN SYSTEM_INFORMATION_CLASS SystemInfo
 
     NTSTATUS Status =
         oNtQuerySystemInformation(SystemInformationClass, SystemInformation, SystemInformationLength, ReturnLength);
+    const HANDLE currentPid = PsGetCurrentProcessId();
 
     // Apply code integrity spoofing to ALL usermode threads
     if (GetPreviousMode() != UserMode)

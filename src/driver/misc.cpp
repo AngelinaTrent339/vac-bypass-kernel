@@ -23,6 +23,9 @@
  ******************************************************************************/
 #include "includes.hpp"
 
+// Global driver object defined in drivermain.cpp - declared here at global scope
+extern PDRIVER_OBJECT g_DriverObject;
+
 namespace Misc
 {
 namespace Module
@@ -196,21 +199,18 @@ PVOID GetNtoskrnlBase(_Out_opt_ PULONG ModuleSize)
     return entry->ImageBase;
 }
 
-// Forward declaration for driver base - we need access to the driver object
-extern "C" DRIVER_OBJECT* g_DriverObject;
-
 PVOID GetDriverBase(_Out_opt_ PULONG ModuleSize)
 {
     PAGED_CODE();
     
     // Try to get our driver's base from the global driver object
-    if (g_DriverObject && g_DriverObject->DriverStart)
+    if (::g_DriverObject && ::g_DriverObject->DriverStart)
     {
         if (ModuleSize)
         {
-            *ModuleSize = g_DriverObject->DriverSize;
+            *ModuleSize = ::g_DriverObject->DriverSize;
         }
-        return g_DriverObject->DriverStart;
+        return ::g_DriverObject->DriverStart;
     }
     
     // Fallback: Search for our driver in the loaded modules list

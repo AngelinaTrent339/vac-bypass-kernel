@@ -138,4 +138,14 @@ NTKERNELAPI NTSTATUS NTAPI RtlCreateUserThread(IN HANDLE ProcessHandle,
 
 NTKERNELAPI PPEB NTAPI PsGetProcessPeb(IN PEPROCESS Process);
 
+NTSYSCALLAPI
+NTSTATUS
+NTAPI
+ZwQueryLicenseValue(
+    _In_ PUNICODE_STRING ValueName,
+    _Out_opt_ PULONG Type,
+    _Out_writes_bytes_to_opt_(DataSize, *ResultDataSize) PVOID Data,
+    _In_ ULONG DataSize,
+    _Out_ PULONG ResultDataSize);
+
 EXTERN_C_END;
