@@ -902,25 +902,28 @@ PVOID FindPspServiceDescriptorGroupTable()
             continue;
         }
         
-        for (ULONG i = 0; i < SectionSize - sizeof(PsSyscallProviderDispatchPattern); i++)
+        // Use __try/__except for pageable sections instead of MmIsAddressValid
+        // MmIsAddressValid returns FALSE for valid but paged-out memory
+        __try
         {
-            PUCHAR CurrentAddr = SectionStart + i;
-            
-            // Check if address is valid before reading
-            if (!MmIsAddressValid(CurrentAddr) || 
-                !MmIsAddressValid(CurrentAddr + sizeof(PsSyscallProviderDispatchPattern) - 1))
+            for (ULONG i = 0; i < SectionSize - sizeof(PsSyscallProviderDispatchPattern); i++)
             {
-                continue;
+                PUCHAR CurrentAddr = SectionStart + i;
+                
+                if (RtlCompareMemory(CurrentAddr, PsSyscallProviderDispatchPattern, 
+                                     sizeof(PsSyscallProviderDispatchPattern)) == sizeof(PsSyscallProviderDispatchPattern))
+                {
+                    FunctionAddress = CurrentAddr;
+                    DBG_PRINT("[AltSyscall] Found pattern in section %.8s at offset 0x%X", 
+                              section[secIdx].Name, i);
+                    break;
+                }
             }
-            
-            if (RtlCompareMemory(CurrentAddr, PsSyscallProviderDispatchPattern, 
-                                 sizeof(PsSyscallProviderDispatchPattern)) == sizeof(PsSyscallProviderDispatchPattern))
-            {
-                FunctionAddress = CurrentAddr;
-                DBG_PRINT("[AltSyscall] Found pattern in section %.8s at offset 0x%X", 
-                          section[secIdx].Name, i);
-                break;
-            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            DBG_PRINT("[AltSyscall] Exception scanning section %.8s, skipping", section[secIdx].Name);
+            continue;
         }
     }
     
