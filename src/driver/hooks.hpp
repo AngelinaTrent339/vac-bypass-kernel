@@ -90,6 +90,15 @@ extern NTSTATUS NTAPI hkNtSetInformationThread(_In_ HANDLE ThreadHandle,
 
 extern NTSTATUS NTAPI hkNtClose(_In_ HANDLE Handle);
 
+extern NTSTATUS NTAPI hkNtProtectVirtualMemory(_In_ HANDLE ProcessHandle, _Inout_ PVOID *BaseAddress,
+                                               _Inout_ PSIZE_T RegionSize, _In_ ULONG NewProtection,
+                                               _Out_ PULONG OldProtection);
+
+extern NTSTATUS NTAPI hkNtWriteVirtualMemory(_In_ HANDLE ProcessHandle, _In_opt_ PVOID BaseAddress,
+                                             _In_reads_bytes_(NumberOfBytesToWrite) PVOID Buffer,
+                                             _In_ SIZE_T NumberOfBytesToWrite,
+                                             _Out_opt_ PSIZE_T NumberOfBytesWritten);
+
 inline SYSCALL_HOOK_ENTRY g_SyscallHookList[] = {
     {FNV("NtMapViewOfSection"), ULONG_MAX, nullptr, &hkNtMapViewOfSection},
     {FNV("NtReadVirtualMemory"), ULONG_MAX, nullptr, &hkNtReadVirtualMemory},
@@ -100,6 +109,8 @@ inline SYSCALL_HOOK_ENTRY g_SyscallHookList[] = {
     {FNV("NtQueryInformationProcess"), ULONG_MAX, nullptr, &hkNtQueryInformationProcess},
     {FNV("NtSetInformationThread"), ULONG_MAX, nullptr, &hkNtSetInformationThread},
     {FNV("NtClose"), ULONG_MAX, nullptr, &hkNtClose},
+    {FNV("NtProtectVirtualMemory"), ULONG_MAX, nullptr, &hkNtProtectVirtualMemory},
+    {FNV("NtWriteVirtualMemory"), ULONG_MAX, nullptr, &hkNtWriteVirtualMemory},
 };
 
 void __fastcall SsdtCallback(ULONG ssdt_index, VOID **ssdt_address);

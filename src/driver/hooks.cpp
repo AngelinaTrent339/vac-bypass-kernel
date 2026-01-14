@@ -80,6 +80,19 @@ PFN_NtSetInformationThread oNtSetInformationThread = nullptr;
 typedef NTSTATUS(NTAPI *PFN_NtClose)(_In_ HANDLE Handle);
 PFN_NtClose oNtClose = nullptr;
 
+// NtProtectVirtualMemory typedef and original pointer
+typedef NTSTATUS(NTAPI *PFN_NtProtectVirtualMemory)(_In_ HANDLE ProcessHandle, _Inout_ PVOID *BaseAddress,
+                                                     _Inout_ PSIZE_T RegionSize, _In_ ULONG NewProtection,
+                                                     _Out_ PULONG OldProtection);
+PFN_NtProtectVirtualMemory oNtProtectVirtualMemory = nullptr;
+
+// NtWriteVirtualMemory typedef and original pointer
+typedef NTSTATUS(NTAPI *PFN_NtWriteVirtualMemory)(_In_ HANDLE ProcessHandle, _In_opt_ PVOID BaseAddress,
+                                                   _In_reads_bytes_(NumberOfBytesToWrite) PVOID Buffer,
+                                                   _In_ SIZE_T NumberOfBytesToWrite,
+                                                   _Out_opt_ PSIZE_T NumberOfBytesWritten);
+PFN_NtWriteVirtualMemory oNtWriteVirtualMemory = nullptr;
+
 void __fastcall SsdtCallback(ULONG ServiceIndex, PVOID *ServiceAddress)
 {
     for (SYSCALL_HOOK_ENTRY &Entry : g_SyscallHookList)
@@ -810,7 +823,7 @@ NTSTATUS NTAPI hkNtQueryInformationProcess(_In_ HANDLE ProcessHandle, _In_ PROCE
                 WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, "NtQueryInformationProcess(ProcessDebugFlags) by %d",
                           HandleToUlong(currentPid));
                 ProbeForWrite(ProcessInformation, sizeof(ULONG), 1);
-                *(PULONG)ProcessInformation = PROCESS_DEBUG_INHERIT; // 1 = not being debugged
+                *(PULONG)ProcessInformation = 1; // 1 = PROCESS_DEBUG_INHERIT = not being debugged
             }
             break;
 
@@ -874,7 +887,7 @@ NTSTATUS NTAPI hkNtClose(_In_ HANDLE Handle)
     {
         // Anti-debug trick: NtClose with invalid handle raises exception if debugged
         // We silently fail instead of raising exception
-        if (Handle == NULL || Handle == INVALID_HANDLE_VALUE)
+        if (Handle == NULL || Handle == (HANDLE)(LONG_PTR)-1)
         {
             return STATUS_INVALID_HANDLE;
         }
@@ -882,7 +895,7 @@ NTSTATUS NTAPI hkNtClose(_In_ HANDLE Handle)
         // Check if handle is valid before closing
         POBJECT_HANDLE_FLAG_INFORMATION handleInfo = {0};
         NTSTATUS queryStatus =
-            ZwQueryObject(Handle, ObjectHandleFlagInformation, &handleInfo, sizeof(handleInfo), NULL);
+            ZwQueryObject(Handle, (OBJECT_INFORMATION_CLASS)4, &handleInfo, sizeof(handleInfo), NULL); // 4 = ObjectHandleFlagInformation
 
         if (!NT_SUCCESS(queryStatus))
         {
@@ -892,6 +905,157 @@ NTSTATUS NTAPI hkNtClose(_In_ HANDLE Handle)
     }
 
     return oNtClose(Handle);
+}
+
+//=============================================================================
+// Helper: Check if address is within ntdll.dll or kernel32.dll
+//=============================================================================
+static BOOLEAN IsAddressInSystemDll(_In_ HANDLE ProcessHandle, _In_ PVOID Address)
+{
+    if (!Address)
+        return FALSE;
+
+    __try
+    {
+        MEMORY_BASIC_INFORMATION mbi = {0};
+        SIZE_T returnLen = 0;
+
+        NTSTATUS status =
+            oNtQueryVirtualMemory(ProcessHandle, Address, (MEMORY_INFORMATION_CLASS)0, &mbi, sizeof(mbi), &returnLen); // 0 = MemoryBasicInformation
+
+        if (!NT_SUCCESS(status) || mbi.Type != MEM_IMAGE)
+            return FALSE;
+
+        // Get mapped file name
+        PUNICODE_STRING mappedName = nullptr;
+        status = Misc::Memory::GetMappedFilename(Address, &mappedName);
+
+        if (!NT_SUCCESS(status) || !mappedName)
+            return FALSE;
+
+        SCOPE_EXIT
+        {
+            if (mappedName)
+                Memory::FreePool(mappedName);
+        };
+
+        // Check if it's ntdll.dll or kernel32.dll
+        if (Misc::String::wcsistr(mappedName->Buffer, L"ntdll.dll") ||
+            Misc::String::wcsistr(mappedName->Buffer, L"kernel32.dll") ||
+            Misc::String::wcsistr(mappedName->Buffer, L"kernelbase.dll"))
+        {
+            return TRUE;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+
+    return FALSE;
+}
+
+//=============================================================================
+// NtProtectVirtualMemory Hook - Block Roblox from making ntdll/kernel32 writable
+//=============================================================================
+NTSTATUS NTAPI hkNtProtectVirtualMemory(_In_ HANDLE ProcessHandle, _Inout_ PVOID *BaseAddress,
+                                        _Inout_ PSIZE_T RegionSize, _In_ ULONG NewProtection,
+                                        _Out_ PULONG OldProtection)
+{
+    InterlockedIncrement(&g_hooksRefCount);
+    SCOPE_EXIT
+    {
+        InterlockedDecrement(&g_hooksRefCount);
+    };
+
+    const HANDLE currentPid = PsGetCurrentProcessId();
+    const HANDLE targetPid = Misc::GetProcessIDFromProcessHandle(ProcessHandle);
+
+    // Only intercept for Roblox process modifying its own memory
+    if (GetPreviousMode() == UserMode && Processes::IsProcessGame(currentPid) &&
+        (targetPid == currentPid || ProcessHandle == NtCurrentProcess()))
+    {
+        __try
+        {
+            ProbeForWrite(BaseAddress, sizeof(PVOID), 1);
+            ProbeForWrite(RegionSize, sizeof(SIZE_T), 1);
+            ProbeForWrite(OldProtection, sizeof(ULONG), 1);
+
+            PVOID CapturedBase = *BaseAddress;
+            SIZE_T CapturedSize = *RegionSize;
+
+            // Check if they're trying to make system DLL writable (to install hooks)
+            BOOLEAN isMakingWritable = (NewProtection & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE |
+                                                         PAGE_EXECUTE_WRITECOPY)) != 0;
+
+            if (isMakingWritable && IsAddressInSystemDll(ProcessHandle, CapturedBase))
+            {
+                // Get current protection to return as "old"
+                MEMORY_BASIC_INFORMATION mbi = {0};
+                SIZE_T returnLen = 0;
+                oNtQueryVirtualMemory(ProcessHandle, CapturedBase, (MEMORY_INFORMATION_CLASS)0, &mbi, sizeof(mbi),
+                                      &returnLen); // 0 = MemoryBasicInformation
+
+                *OldProtection = mbi.Protect;
+
+                DBG_PRINT("[AntiHook] BLOCKED VirtualProtect on system DLL @ 0x%p (wanted 0x%X)", CapturedBase,
+                          NewProtection);
+
+                // LIE - Say we did it, but we didn't
+                return STATUS_SUCCESS;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+    }
+
+    return oNtProtectVirtualMemory(ProcessHandle, BaseAddress, RegionSize, NewProtection, OldProtection);
+}
+
+//=============================================================================
+// NtWriteVirtualMemory Hook - Block Roblox from writing hooks to ntdll/kernel32
+//=============================================================================
+NTSTATUS NTAPI hkNtWriteVirtualMemory(_In_ HANDLE ProcessHandle, _In_opt_ PVOID BaseAddress,
+                                      _In_reads_bytes_(NumberOfBytesToWrite) PVOID Buffer,
+                                      _In_ SIZE_T NumberOfBytesToWrite, _Out_opt_ PSIZE_T NumberOfBytesWritten)
+{
+    InterlockedIncrement(&g_hooksRefCount);
+    SCOPE_EXIT
+    {
+        InterlockedDecrement(&g_hooksRefCount);
+    };
+
+    const HANDLE currentPid = PsGetCurrentProcessId();
+    const HANDLE targetPid = Misc::GetProcessIDFromProcessHandle(ProcessHandle);
+
+    // Only intercept for Roblox process writing to its own memory
+    if (GetPreviousMode() == UserMode && Processes::IsProcessGame(currentPid) &&
+        (targetPid == currentPid || ProcessHandle == NtCurrentProcess()))
+    {
+        // Check if they're trying to write to system DLL (installing hooks)
+        if (IsAddressInSystemDll(ProcessHandle, BaseAddress))
+        {
+            DBG_PRINT("[AntiHook] BLOCKED WriteVirtualMemory to system DLL @ 0x%p size 0x%llX", BaseAddress,
+                      NumberOfBytesToWrite);
+
+            // LIE - Say we wrote it, but we didn't
+            __try
+            {
+                if (NumberOfBytesWritten)
+                {
+                    ProbeForWrite(NumberOfBytesWritten, sizeof(SIZE_T), 1);
+                    *NumberOfBytesWritten = NumberOfBytesToWrite;
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
+
+            return STATUS_SUCCESS;
+        }
+    }
+
+    return oNtWriteVirtualMemory(ProcessHandle, BaseAddress, Buffer, NumberOfBytesToWrite, NumberOfBytesWritten);
 }
 
 BOOLEAN CreateHook(const FNV1A_t ServiceNameHash, PVOID *OriginalRoutine)
@@ -935,6 +1099,8 @@ NTSTATUS Initialize()
     CREATE_HOOK(NtQueryInformationProcess);
     CREATE_HOOK(NtSetInformationThread);
     CREATE_HOOK(NtClose);
+    CREATE_HOOK(NtProtectVirtualMemory);
+    CREATE_HOOK(NtWriteVirtualMemory);
 
 #undef CREATE_HOOK
 
