@@ -782,7 +782,7 @@ ULONG64 __fastcall AltSyscallHandler(
 {
     UNREFERENCED_PARAMETER(pNtFunction);
     
-    if (!ArgsBase || !P3Home)
+    if (!ArgsBase)
     {
         return 1;  // Continue normal dispatch
     }
@@ -794,48 +794,79 @@ ULONG64 __fastcall AltSyscallHandler(
         InterlockedDecrement(&Hooks::g_hooksRefCount);
     };
     
-    // Calculate KTRAP_FRAME address from P3Home
-    // P3Home is at offset 0x10 in KTRAP_FRAME
-    PKTRAP_FRAME TrapFrame = reinterpret_cast<PKTRAP_FRAME>(
-        reinterpret_cast<PUCHAR>(P3Home) - 0x10);
+    // Get KTRAP_FRAME for accessing user stack and storing result
+    PKTRAP_FRAME TrapFrame = nullptr;
+    if (P3Home)
+    {
+        TrapFrame = reinterpret_cast<PKTRAP_FRAME>(
+            reinterpret_cast<PUCHAR>(P3Home) - 0x10);
+    }
     
-    // Get stack pointer for additional arguments (5th arg onwards)
-    PVOID Rsp = reinterpret_cast<PVOID>(TrapFrame->Rsp);
-    constexpr ULONG ARG5_STACK_OFFSET = 0x28;  // 5th arg is at RSP + 0x28
-    
-    // Extract first 4 arguments from ArgsBase
+    // Extract arguments from ArgsBase (first 4 args stored as RCX, RDX, R8, R9)
     PULONG_PTR Args = reinterpret_cast<PULONG_PTR>(ArgsBase);
-    ULONG_PTR Arg1 = Args[0];  // RCX
-    ULONG_PTR Arg2 = Args[1];  // RDX
-    ULONG_PTR Arg3 = Args[2];  // R8
-    ULONG_PTR Arg4 = Args[3];  // R9
     
-    UNREFERENCED_PARAMETER(Arg1);
-    UNREFERENCED_PARAMETER(Arg2);
-    UNREFERENCED_PARAMETER(Arg3);
-    UNREFERENCED_PARAMETER(Arg4);
-    UNREFERENCED_PARAMETER(Rsp);
-    UNREFERENCED_PARAMETER(ARG5_STACK_OFFSET);
-    
-    // Check if this syscall is one we're interested in
+    // Check if this syscall is one we're hooking
     for (Hooks::SYSCALL_HOOK_ENTRY& Entry : Hooks::g_SyscallHookList)
     {
-        if (Entry.ServiceIndex == Ssn && Entry.ServiceIndex != ULONG_MAX)
+        if (Entry.ServiceIndex == Ssn && Entry.ServiceIndex != ULONG_MAX && Entry.NewRoutineAddress)
         {
-            DBG_PRINT("[AltSyscall] Intercepted SSN 0x%X", Ssn);
+            NTSTATUS Result = STATUS_SUCCESS;
             
-            // TODO: Implement actual hook logic here
-            // You can:
-            // 1. Inspect arguments via ArgsBase
-            // 2. Modify KTRAP_FRAME directly to change arguments
-            // 3. Return 0 to skip the syscall entirely
-            // 4. Modify TrapFrame->P3Home to change the return value (when returning 0)
+            DBG_PRINT("[AltSyscall] Intercepted SSN 0x%X, calling hook", Ssn);
             
-            break;
+            // Call hook based on function signature
+            // NtQuerySystemInformation: 4 args
+            if (Entry.ServiceNameHash == FNV("NtQuerySystemInformation"))
+            {
+                auto HookFunc = reinterpret_cast<decltype(&Hooks::hkNtQuerySystemInformation)>(Entry.NewRoutineAddress);
+                Result = HookFunc(
+                    static_cast<SYSTEM_INFORMATION_CLASS>(Args[0]),
+                    reinterpret_cast<PVOID>(Args[1]),
+                    static_cast<ULONG>(Args[2]),
+                    reinterpret_cast<PULONG>(Args[3])
+                );
+            }
+            // NtQueryLicenseValue: 5 args (5th from user stack)
+            else if (Entry.ServiceNameHash == FNV("NtQueryLicenseValue") && TrapFrame)
+            {
+                // 5th arg is at RSP + 0x28 in usermode stack
+                PULONG ResultDataSize = nullptr;
+                __try
+                {
+                    ResultDataSize = *reinterpret_cast<PULONG*>(TrapFrame->Rsp + 0x28);
+                }
+                __except(EXCEPTION_EXECUTE_HANDLER)
+                {
+                    return 1;  // Can't read stack, let kernel handle it
+                }
+                
+                auto HookFunc = reinterpret_cast<decltype(&Hooks::hkNtQueryLicenseValue)>(Entry.NewRoutineAddress);
+                Result = HookFunc(
+                    reinterpret_cast<PUNICODE_STRING>(Args[0]),
+                    reinterpret_cast<PULONG>(Args[1]),
+                    reinterpret_cast<PVOID>(Args[2]),
+                    static_cast<ULONG>(Args[3]),
+                    ResultDataSize
+                );
+            }
+            else
+            {
+                // For other hooks, let kernel handle and we'll figure out later
+                return 1;
+            }
+            
+            // Store result in RAX via TrapFrame
+            if (TrapFrame)
+            {
+                TrapFrame->Rax = static_cast<ULONG64>(Result);
+            }
+            
+            // Return 0 to tell kernel we handled it (skip normal dispatch)
+            return 0;
         }
     }
     
-    // Return 1 to continue normal syscall execution
+    // SSN not in our hook list - continue normal syscall execution
     return 1;
 }
 
