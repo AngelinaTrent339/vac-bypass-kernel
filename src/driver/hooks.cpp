@@ -47,6 +47,19 @@ decltype(&NtReadVirtualMemory) oNtReadVirtualMemory = nullptr;
 decltype(&NtQueryVirtualMemory) oNtQueryVirtualMemory = nullptr;
 decltype(&ZwMapViewOfSection) oNtMapViewOfSection = nullptr;
 
+// NtQueryLicenseValue typedef and original pointer
+typedef NTSTATUS(NTAPI *PFN_NtQueryLicenseValue)(_In_ PUNICODE_STRING ValueName, _Out_opt_ PULONG Type,
+                                                  _Out_writes_bytes_to_opt_(DataSize, *ResultDataSize) PVOID Data,
+                                                  _In_ ULONG DataSize, _Out_ PULONG ResultDataSize);
+PFN_NtQueryLicenseValue oNtQueryLicenseValue = nullptr;
+
+// NtQueryValueKey typedef and original pointer
+typedef NTSTATUS(NTAPI *PFN_NtQueryValueKey)(_In_ HANDLE KeyHandle, _In_ PUNICODE_STRING ValueName,
+                                              _In_ KEY_VALUE_INFORMATION_CLASS KeyValueInformationClass,
+                                              _Out_writes_bytes_opt_(Length) PVOID KeyValueInformation,
+                                              _In_ ULONG Length, _Out_ PULONG ResultLength);
+PFN_NtQueryValueKey oNtQueryValueKey = nullptr;
+
 void __fastcall SsdtCallback(ULONG ServiceIndex, PVOID *ServiceAddress)
 {
     for (SYSCALL_HOOK_ENTRY &Entry : g_SyscallHookList)
@@ -527,6 +540,201 @@ Exit:
     return Status;
 }
 
+//=============================================================================
+// NtQueryLicenseValue Hook - Hides test signing license values
+//=============================================================================
+static const WCHAR *g_BlockedLicenseValues[] = {
+    L"CodeIntegrity-AllowUnsignedDrivers",
+    L"CodeIntegrity-AllowConfigurablePolicy-CustomKernelSigners",
+};
+
+NTSTATUS NTAPI hkNtQueryLicenseValue(_In_ PUNICODE_STRING ValueName, _Out_opt_ PULONG Type,
+                                     _Out_writes_bytes_to_opt_(DataSize, *ResultDataSize) PVOID Data,
+                                     _In_ ULONG DataSize, _Out_ PULONG ResultDataSize)
+{
+    InterlockedIncrement(&g_hooksRefCount);
+    SCOPE_EXIT
+    {
+        InterlockedDecrement(&g_hooksRefCount);
+    };
+
+    if (GetPreviousMode() != UserMode || !ValueName || !ValueName->Buffer)
+    {
+        return oNtQueryLicenseValue(ValueName, Type, Data, DataSize, ResultDataSize);
+    }
+
+    const HANDLE currentPid = PsGetCurrentProcessId();
+    if (!Processes::IsProcessInList(currentPid))
+    {
+        return oNtQueryLicenseValue(ValueName, Type, Data, DataSize, ResultDataSize);
+    }
+
+    BOOLEAN shouldSpoof = FALSE;
+
+    __try
+    {
+        for (const WCHAR *blocked : g_BlockedLicenseValues)
+        {
+            UNICODE_STRING blockedStr;
+            RtlInitUnicodeString(&blockedStr, blocked);
+            if (RtlCompareUnicodeString(ValueName, &blockedStr, TRUE) == 0)
+            {
+                shouldSpoof = TRUE;
+                WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, "NtQueryLicenseValue(%wZ) by %d - SPOOFING", ValueName,
+                          HandleToUlong(currentPid));
+                break;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return oNtQueryLicenseValue(ValueName, Type, Data, DataSize, ResultDataSize);
+    }
+
+    if (shouldSpoof)
+    {
+        if (Data && DataSize >= sizeof(ULONG))
+        {
+            __try
+            {
+                ProbeForWrite(Data, DataSize, 1);
+                *(PULONG)Data = 0; // Say unsigned drivers NOT allowed
+                if (Type)
+                {
+                    ProbeForWrite(Type, sizeof(ULONG), 1);
+                    *Type = REG_DWORD;
+                }
+                if (ResultDataSize)
+                {
+                    ProbeForWrite(ResultDataSize, sizeof(ULONG), 1);
+                    *ResultDataSize = sizeof(ULONG);
+                }
+                return STATUS_SUCCESS;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
+        }
+        if (ResultDataSize)
+        {
+            __try
+            {
+                ProbeForWrite(ResultDataSize, sizeof(ULONG), 1);
+                *ResultDataSize = sizeof(ULONG);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
+        }
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    return oNtQueryLicenseValue(ValueName, Type, Data, DataSize, ResultDataSize);
+}
+
+//=============================================================================
+// NtQueryValueKey Hook - Removes TESTSIGNING from SystemStartOptions
+//=============================================================================
+static void RemoveSubstringW(PWCHAR str, ULONG maxLen, const WCHAR *substr)
+{
+    if (!str || !substr || maxLen == 0)
+        return;
+
+    PWCHAR found = wcsstr(str, substr);
+    if (found)
+    {
+        SIZE_T substrLen = wcslen(substr);
+        SIZE_T remainLen = wcslen(found + substrLen);
+
+        // Remove leading or trailing space
+        if (found > str && *(found - 1) == L' ')
+        {
+            found--;
+            substrLen++;
+        }
+        else if (found[substrLen] == L' ')
+        {
+            substrLen++;
+        }
+
+        RtlMoveMemory(found, found + substrLen, (remainLen + 1) * sizeof(WCHAR));
+    }
+}
+
+NTSTATUS NTAPI hkNtQueryValueKey(_In_ HANDLE KeyHandle, _In_ PUNICODE_STRING ValueName,
+                                 _In_ KEY_VALUE_INFORMATION_CLASS KeyValueInformationClass,
+                                 _Out_writes_bytes_opt_(Length) PVOID KeyValueInformation, _In_ ULONG Length,
+                                 _Out_ PULONG ResultLength)
+{
+    InterlockedIncrement(&g_hooksRefCount);
+    SCOPE_EXIT
+    {
+        InterlockedDecrement(&g_hooksRefCount);
+    };
+
+    NTSTATUS Status =
+        oNtQueryValueKey(KeyHandle, ValueName, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+
+    if (!NT_SUCCESS(Status) || !KeyValueInformation || !ValueName || !ValueName->Buffer)
+    {
+        return Status;
+    }
+
+    if (GetPreviousMode() != UserMode)
+    {
+        return Status;
+    }
+
+    const HANDLE currentPid = PsGetCurrentProcessId();
+    if (!Processes::IsProcessInList(currentPid))
+    {
+        return Status;
+    }
+
+    __try
+    {
+        UNICODE_STRING targetValueName;
+        RtlInitUnicodeString(&targetValueName, L"SystemStartOptions");
+
+        if (RtlCompareUnicodeString(ValueName, &targetValueName, TRUE) != 0)
+        {
+            return Status;
+        }
+
+        WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, "NtQueryValueKey(SystemStartOptions) by %d",
+                  HandleToUlong(currentPid));
+
+        switch (KeyValueInformationClass)
+        {
+        case KeyValuePartialInformation: {
+            PKEY_VALUE_PARTIAL_INFORMATION pInfo = (PKEY_VALUE_PARTIAL_INFORMATION)KeyValueInformation;
+            if (pInfo->Type == REG_SZ && pInfo->DataLength > sizeof(WCHAR))
+            {
+                PWCHAR data = (PWCHAR)pInfo->Data;
+                RemoveSubstringW(data, pInfo->DataLength / sizeof(WCHAR), L"TESTSIGNING");
+                pInfo->DataLength = (ULONG)((wcslen(data) + 1) * sizeof(WCHAR));
+            }
+            break;
+        }
+        case KeyValueFullInformation: {
+            PKEY_VALUE_FULL_INFORMATION pInfo = (PKEY_VALUE_FULL_INFORMATION)KeyValueInformation;
+            if (pInfo->Type == REG_SZ && pInfo->DataLength > sizeof(WCHAR))
+            {
+                PWCHAR data = (PWCHAR)((PUCHAR)pInfo + pInfo->DataOffset);
+                RemoveSubstringW(data, pInfo->DataLength / sizeof(WCHAR), L"TESTSIGNING");
+                pInfo->DataLength = (ULONG)((wcslen(data) + 1) * sizeof(WCHAR));
+            }
+            break;
+        }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+
+    return Status;
+}
+
 BOOLEAN CreateHook(const FNV1A_t ServiceNameHash, PVOID *OriginalRoutine)
 {
     for (auto &entry : g_SyscallHookList)
@@ -563,6 +771,8 @@ NTSTATUS Initialize()
     CREATE_HOOK(NtReadVirtualMemory);
     CREATE_HOOK(NtQueryVirtualMemory);
     CREATE_HOOK(NtQuerySystemInformation);
+    CREATE_HOOK(NtQueryLicenseValue);
+    CREATE_HOOK(NtQueryValueKey);
 
 #undef CREATE_HOOK
 
