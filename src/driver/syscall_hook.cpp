@@ -906,17 +906,19 @@ PVOID FindPspServiceDescriptorGroupTable()
               InstructionAddress[0], InstructionAddress[1], InstructionAddress[2],
               InstructionAddress[3], InstructionAddress[4], InstructionAddress[5], InstructionAddress[6]);
     
-    // Verify it's a mov instruction (48 8B 05 = mov rax, [rip+disp32])
-    if (InstructionAddress[0] != 0x48 || InstructionAddress[1] != 0x8B || InstructionAddress[2] != 0x05)
+    // The instruction is "lea rcx, [rip+disp32]" which is 48 8D 0D (NOT 48 8B 05)
+    // From disassembly: 488d0dd2167900  lea rcx,[nt!PspServiceDescriptorGroupTable]
+    if (InstructionAddress[0] != 0x48 || InstructionAddress[1] != 0x8D || InstructionAddress[2] != 0x0D)
     {
-        DBG_PRINT("[AltSyscall] WARNING: Expected 48 8B 05 instruction at offset 0x77!");
-        // Try to find it nearby
+        DBG_PRINT("[AltSyscall] WARNING: Expected 48 8D 0D (lea rcx) instruction at offset 0x77!");
+        // Try to find it nearby - look for LEA instruction with RIP-relative addressing
         for (int offset = 0x70; offset < 0x90; offset++)
         {
             PUCHAR probe = FunctionAddress + offset;
-            if (probe[0] == 0x48 && probe[1] == 0x8B && probe[2] == 0x05)
+            // 48 8D 0D = lea rcx, [rip+disp32]
+            if (probe[0] == 0x48 && probe[1] == 0x8D && probe[2] == 0x0D)
             {
-                DBG_PRINT("[AltSyscall] Found 48 8B 05 at offset 0x%X", offset);
+                DBG_PRINT("[AltSyscall] Found 48 8D 0D (lea rcx) at offset 0x%X", offset);
                 InstructionAddress = probe;
                 break;
             }
@@ -1256,25 +1258,38 @@ NTSTATUS InitializeAltSyscallHook()
     DBG_PRINT("[AltSyscall] Descriptor table filled, writing to PspServiceDescriptorGroupTable...");
     
     // Write our row to PspServiceDescriptorGroupTable
-    // NOTE: This will fail if HVCI is enabled!
+    // Disable CR0.WP to allow writing to read-only kernel memory
+    // NOTE: This will NOT work if HVCI is enabled!
+    
+    KIRQL oldIrql = KeRaiseIrqlToDpcLevel();
+    ULONG_PTR cr0 = __readcr0();
+    __writecr0(cr0 & ~0x10000);  // Clear WP bit (bit 16)
+    _mm_lfence();
+    
     __try
     {
-        DBG_PRINT("[AltSyscall] Writing DriverBase...");
+        DBG_PRINT("[AltSyscall] CR0.WP disabled, writing...");
         g_PspServiceDescriptorGroupTable->Rows[ALT_SYSCALL_SLOT_ID].DriverBase = g_DriverBase;
-        DBG_PRINT("[AltSyscall] Writing DispatchTable...");
         g_PspServiceDescriptorGroupTable->Rows[ALT_SYSCALL_SLOT_ID].DispatchTable = g_AltSyscallDispatchTable;
-        DBG_PRINT("[AltSyscall] Writing Reserved...");
         g_PspServiceDescriptorGroupTable->Rows[ALT_SYSCALL_SLOT_ID].Reserved = nullptr;
         DBG_PRINT("[AltSyscall] Write complete!");
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
+        // Restore CR0.WP before returning
+        __writecr0(cr0);
+        KeLowerIrql(oldIrql);
+        
         WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, 
                   "Exception writing to PspServiceDescriptorGroupTable - HVCI may be blocking writes!");
         Memory::FreePool(g_AltSyscallDispatchTable);
         g_AltSyscallDispatchTable = nullptr;
         return STATUS_ACCESS_VIOLATION;
     }
+    
+    // Restore CR0.WP
+    __writecr0(cr0);
+    KeLowerIrql(oldIrql);
     
     DBG_PRINT("[AltSyscall] Installed dispatch table at slot %u", ALT_SYSCALL_SLOT_ID);
     
