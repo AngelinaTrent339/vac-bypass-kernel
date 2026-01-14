@@ -277,7 +277,16 @@
     <ClInclude Include="stealth_inject.hpp" />
     <ClInclude Include="stealth_shellcode.hpp" />
   </ItemGroup>
+  <ItemGroup>
+    <MASM Include="stealth_shellcode.asm">
+      <UseSafeExceptionHandlers>false</UseSafeExceptionHandlers>
+    </MASM>
+  </ItemGroup>
+  <ImportGroup Label="ExtensionSettings">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.props" />
+  </ImportGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.targets" />
   </ImportGroup>
 </Project>
