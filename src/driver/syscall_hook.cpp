@@ -856,6 +856,8 @@ PVOID FindPspServiceDescriptorGroupTable()
     // Pattern: 4C 8D 05 ?? ?? ?? ?? (lea r8, [rip+offset])
     // This is followed by indexing into the table
     
+    DBG_PRINT("[AltSyscall] Searching for pattern in PAGE section...");
+    
     const PUCHAR Pattern = Misc::Memory::FindPattern(
         NTOS_BASE, 
         "PAGE",  // Usually in PAGE section
@@ -863,8 +865,12 @@ PVOID FindPspServiceDescriptorGroupTable()
         "48 6B ?? 18"            // imul reg, reg, 0x18 (size of each row)
     );
     
+    DBG_PRINT("[AltSyscall] Pattern result: 0x%p", Pattern);
+    
     if (!Pattern)
     {
+        DBG_PRINT("[AltSyscall] First pattern failed, trying .text section...");
+        
         // Try alternate pattern
         const PUCHAR AltPattern = Misc::Memory::FindPattern(
             NTOS_BASE,
@@ -873,15 +879,36 @@ PVOID FindPspServiceDescriptorGroupTable()
             "49 8B 04 C0"            // mov rax, [r8+rax*8]
         );
         
+        DBG_PRINT("[AltSyscall] Alt pattern result: 0x%p", AltPattern);
+        
         if (AltPattern)
         {
-            return RipToAbsolute<PVOID>(reinterpret_cast<ULONG_PTR>(AltPattern), 3, 7);
+            PVOID resolved = RipToAbsolute<PVOID>(reinterpret_cast<ULONG_PTR>(AltPattern), 3, 7);
+            DBG_PRINT("[AltSyscall] Resolved address from alt pattern: 0x%p", resolved);
+            return resolved;
         }
         
         return nullptr;
     }
     
-    return RipToAbsolute<PVOID>(reinterpret_cast<ULONG_PTR>(Pattern), 3, 7);
+    PVOID resolved = RipToAbsolute<PVOID>(reinterpret_cast<ULONG_PTR>(Pattern), 3, 7);
+    DBG_PRINT("[AltSyscall] Resolved address from pattern: 0x%p", resolved);
+    
+    // Dump first few bytes at the resolved address to verify
+    if (MmIsAddressValid(resolved))
+    {
+        PUCHAR ptr = reinterpret_cast<PUCHAR>(resolved);
+        DBG_PRINT("[AltSyscall] First 24 bytes at resolved addr: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+            ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5], ptr[6], ptr[7],
+            ptr[8], ptr[9], ptr[10], ptr[11], ptr[12], ptr[13], ptr[14], ptr[15],
+            ptr[16], ptr[17], ptr[18], ptr[19], ptr[20], ptr[21], ptr[22], ptr[23]);
+    }
+    else
+    {
+        DBG_PRINT("[AltSyscall] WARNING: Resolved address 0x%p is NOT VALID!", resolved);
+    }
+    
+    return resolved;
 }
 
 // ============================================================================
@@ -1130,6 +1157,16 @@ NTSTATUS InitializeAltSyscallHook()
     }
     
     DBG_PRINT("[AltSyscall] PspServiceDescriptorGroupTable = 0x%p", g_PspServiceDescriptorGroupTable);
+    
+    // Validate the address before we use it
+    if (!MmIsAddressValid(g_PspServiceDescriptorGroupTable))
+    {
+        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, 
+                  "PspServiceDescriptorGroupTable address 0x%p is INVALID!", g_PspServiceDescriptorGroupTable);
+        return STATUS_INVALID_ADDRESS;
+    }
+    
+    DBG_PRINT("[AltSyscall] Address validated, allocating dispatch table...");
     
     // Allocate our dispatch table
     g_AltSyscallDispatchTable = reinterpret_cast<PALT_SYSCALL_DISPATCH_TABLE>(
