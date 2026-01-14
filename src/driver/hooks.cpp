@@ -562,9 +562,7 @@ NTSTATUS Initialize()
     CREATE_HOOK(NtMapViewOfSection);
     CREATE_HOOK(NtReadVirtualMemory);
     CREATE_HOOK(NtQueryVirtualMemory);
-#if DBG
     CREATE_HOOK(NtQuerySystemInformation);
-#endif
 
 #undef CREATE_HOOK
 
