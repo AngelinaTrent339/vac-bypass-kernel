@@ -42,130 +42,6 @@ namespace Hooks
 volatile LONG g_hooksRefCount = 0;
 bool g_shouldBypass = true;
 
-//=============================================================================
-// Fake Hook Bytes Tracking - Store what Roblox THINKS it wrote to system DLLs
-//=============================================================================
-#define MAX_FAKE_WRITES 64
-#define MAX_FAKE_WRITE_SIZE 64
-
-typedef struct _FAKE_WRITE_ENTRY
-{
-    HANDLE ProcessId;
-    PVOID Address;
-    SIZE_T Size;
-    UCHAR FakeBytes[MAX_FAKE_WRITE_SIZE];  // What Roblox tried to write
-    BOOLEAN InUse;
-} FAKE_WRITE_ENTRY, *PFAKE_WRITE_ENTRY;
-
-FAKE_WRITE_ENTRY g_FakeWrites[MAX_FAKE_WRITES] = {0};
-KSPIN_LOCK g_FakeWritesLock;
-BOOLEAN g_FakeWritesInitialized = FALSE;
-
-void InitFakeWrites()
-{
-    if (!g_FakeWritesInitialized)
-    {
-        KeInitializeSpinLock(&g_FakeWritesLock);
-        RtlZeroMemory(g_FakeWrites, sizeof(g_FakeWrites));
-        g_FakeWritesInitialized = TRUE;
-    }
-}
-
-BOOLEAN AddFakeWrite(_In_ HANDLE ProcessId, _In_ PVOID Address, _In_ PVOID Buffer, _In_ SIZE_T Size)
-{
-    if (Size > MAX_FAKE_WRITE_SIZE)
-        Size = MAX_FAKE_WRITE_SIZE;
-
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&g_FakeWritesLock, &oldIrql);
-
-    // Check if entry already exists
-    for (ULONG i = 0; i < MAX_FAKE_WRITES; i++)
-    {
-        if (g_FakeWrites[i].InUse && g_FakeWrites[i].ProcessId == ProcessId &&
-            g_FakeWrites[i].Address == Address)
-        {
-            // Update existing entry
-            __try
-            {
-                ProbeForRead(Buffer, Size, 1);
-                RtlCopyMemory(g_FakeWrites[i].FakeBytes, Buffer, Size);
-                g_FakeWrites[i].Size = Size;
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-            }
-            KeReleaseSpinLock(&g_FakeWritesLock, oldIrql);
-            return TRUE;
-        }
-    }
-
-    // Find free slot
-    for (ULONG i = 0; i < MAX_FAKE_WRITES; i++)
-    {
-        if (!g_FakeWrites[i].InUse)
-        {
-            g_FakeWrites[i].ProcessId = ProcessId;
-            g_FakeWrites[i].Address = Address;
-            __try
-            {
-                ProbeForRead(Buffer, Size, 1);
-                RtlCopyMemory(g_FakeWrites[i].FakeBytes, Buffer, Size);
-                g_FakeWrites[i].Size = Size;
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-                KeReleaseSpinLock(&g_FakeWritesLock, oldIrql);
-                return FALSE;
-            }
-            g_FakeWrites[i].InUse = TRUE;
-            KeReleaseSpinLock(&g_FakeWritesLock, oldIrql);
-            return TRUE;
-        }
-    }
-
-    KeReleaseSpinLock(&g_FakeWritesLock, oldIrql);
-    return FALSE;
-}
-
-PFAKE_WRITE_ENTRY FindFakeWrite(_In_ HANDLE ProcessId, _In_ PVOID Address, _In_ SIZE_T Size)
-{
-    ULONG_PTR ReadStart = (ULONG_PTR)Address;
-    ULONG_PTR ReadEnd = ReadStart + Size;
-
-    for (ULONG i = 0; i < MAX_FAKE_WRITES; i++)
-    {
-        if (g_FakeWrites[i].InUse && g_FakeWrites[i].ProcessId == ProcessId)
-        {
-            ULONG_PTR FakeStart = (ULONG_PTR)g_FakeWrites[i].Address;
-            ULONG_PTR FakeEnd = FakeStart + g_FakeWrites[i].Size;
-
-            // Check for overlap
-            if (ReadStart < FakeEnd && ReadEnd > FakeStart)
-            {
-                return &g_FakeWrites[i];
-            }
-        }
-    }
-    return nullptr;
-}
-
-void RemoveFakeWritesForProcess(_In_ HANDLE ProcessId)
-{
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&g_FakeWritesLock, &oldIrql);
-
-    for (ULONG i = 0; i < MAX_FAKE_WRITES; i++)
-    {
-        if (g_FakeWrites[i].InUse && g_FakeWrites[i].ProcessId == ProcessId)
-        {
-            g_FakeWrites[i].InUse = FALSE;
-        }
-    }
-
-    KeReleaseSpinLock(&g_FakeWritesLock, oldIrql);
-}
-
 decltype(&ZwQuerySystemInformation) oNtQuerySystemInformation = nullptr;
 decltype(&NtReadVirtualMemory) oNtReadVirtualMemory = nullptr;
 decltype(&NtQueryVirtualMemory) oNtQueryVirtualMemory = nullptr;
@@ -203,19 +79,6 @@ PFN_NtSetInformationThread oNtSetInformationThread = nullptr;
 // NtClose typedef and original pointer
 typedef NTSTATUS(NTAPI *PFN_NtClose)(_In_ HANDLE Handle);
 PFN_NtClose oNtClose = nullptr;
-
-// NtProtectVirtualMemory typedef and original pointer
-typedef NTSTATUS(NTAPI *PFN_NtProtectVirtualMemory)(_In_ HANDLE ProcessHandle, _Inout_ PVOID *BaseAddress,
-                                                     _Inout_ PSIZE_T RegionSize, _In_ ULONG NewProtection,
-                                                     _Out_ PULONG OldProtection);
-PFN_NtProtectVirtualMemory oNtProtectVirtualMemory = nullptr;
-
-// NtWriteVirtualMemory typedef and original pointer
-typedef NTSTATUS(NTAPI *PFN_NtWriteVirtualMemory)(_In_ HANDLE ProcessHandle, _In_opt_ PVOID BaseAddress,
-                                                   _In_reads_bytes_(NumberOfBytesToWrite) PVOID Buffer,
-                                                   _In_ SIZE_T NumberOfBytesToWrite,
-                                                   _Out_opt_ PSIZE_T NumberOfBytesWritten);
-PFN_NtWriteVirtualMemory oNtWriteVirtualMemory = nullptr;
 
 void __fastcall SsdtCallback(ULONG ServiceIndex, PVOID *ServiceAddress)
 {
@@ -397,56 +260,6 @@ NTSTATUS NTAPI hkNtReadVirtualMemory(HANDLE ProcessHandle, PVOID BaseAddress, PV
 
     const HANDLE currentPid = PsGetCurrentProcessId();
     const HANDLE targetPid = Misc::GetProcessIDFromProcessHandle(ProcessHandle);
-
-    //=============================================================================
-    // Roblox reading its own memory to verify hooks - return fake bytes
-    //=============================================================================
-    if (GetPreviousMode() == UserMode && Processes::IsProcessGame(currentPid) &&
-        (targetPid == currentPid || ProcessHandle == NtCurrentProcess()))
-    {
-        // Check if this read overlaps with any fake write we recorded
-        PFAKE_WRITE_ENTRY fakeEntry = FindFakeWrite(currentPid, BaseAddress, NumberOfBytesToRead);
-        if (fakeEntry)
-        {
-            // Call original to get real memory first
-            NTSTATUS status = oNtReadVirtualMemory(ProcessHandle, BaseAddress, Buffer, NumberOfBytesToRead, NumberOfBytesReaded);
-            
-            if (NT_SUCCESS(status))
-            {
-                // Now overlay the fake bytes
-                __try
-                {
-                    ProbeForWrite(Buffer, NumberOfBytesToRead, 1);
-                    
-                    ULONG_PTR ReadStart = (ULONG_PTR)BaseAddress;
-                    ULONG_PTR FakeStart = (ULONG_PTR)fakeEntry->Address;
-                    ULONG_PTR FakeEnd = FakeStart + fakeEntry->Size;
-                    
-                    // Calculate overlap
-                    ULONG_PTR OverlapStart = max(ReadStart, FakeStart);
-                    ULONG_PTR OverlapEnd = min(ReadStart + NumberOfBytesToRead, FakeEnd);
-                    
-                    if (OverlapEnd > OverlapStart)
-                    {
-                        SIZE_T OverlapSize = OverlapEnd - OverlapStart;
-                        SIZE_T BufferOffset = OverlapStart - ReadStart;
-                        SIZE_T FakeOffset = OverlapStart - FakeStart;
-                        
-                        RtlCopyMemory((PUCHAR)Buffer + BufferOffset, 
-                                      fakeEntry->FakeBytes + FakeOffset, 
-                                      OverlapSize);
-                        
-                        DBG_PRINT("[AntiHook] Spoofed read at 0x%p, returning fake hook bytes", BaseAddress);
-                    }
-                }
-                __except (EXCEPTION_EXECUTE_HANDLER)
-                {
-                }
-            }
-            
-            return status;
-        }
-    }
 
     // Check if bypass is enabled and if requestor process is Steam and requested process is game
     //
@@ -997,7 +810,7 @@ NTSTATUS NTAPI hkNtQueryInformationProcess(_In_ HANDLE ProcessHandle, _In_ PROCE
                 WPP_PRINT(TRACE_LEVEL_INFORMATION, GENERAL, "NtQueryInformationProcess(ProcessDebugFlags) by %d",
                           HandleToUlong(currentPid));
                 ProbeForWrite(ProcessInformation, sizeof(ULONG), 1);
-                *(PULONG)ProcessInformation = 1; // 1 = PROCESS_DEBUG_INHERIT = not being debugged
+                *(PULONG)ProcessInformation = PROCESS_DEBUG_INHERIT; // 1 = not being debugged
             }
             break;
 
@@ -1061,7 +874,7 @@ NTSTATUS NTAPI hkNtClose(_In_ HANDLE Handle)
     {
         // Anti-debug trick: NtClose with invalid handle raises exception if debugged
         // We silently fail instead of raising exception
-        if (Handle == NULL || Handle == (HANDLE)(LONG_PTR)-1)
+        if (Handle == NULL || Handle == INVALID_HANDLE_VALUE)
         {
             return STATUS_INVALID_HANDLE;
         }
@@ -1069,7 +882,7 @@ NTSTATUS NTAPI hkNtClose(_In_ HANDLE Handle)
         // Check if handle is valid before closing
         POBJECT_HANDLE_FLAG_INFORMATION handleInfo = {0};
         NTSTATUS queryStatus =
-            ZwQueryObject(Handle, (OBJECT_INFORMATION_CLASS)4, &handleInfo, sizeof(handleInfo), NULL); // 4 = ObjectHandleFlagInformation
+            ZwQueryObject(Handle, ObjectHandleFlagInformation, &handleInfo, sizeof(handleInfo), NULL);
 
         if (!NT_SUCCESS(queryStatus))
         {
@@ -1079,160 +892,6 @@ NTSTATUS NTAPI hkNtClose(_In_ HANDLE Handle)
     }
 
     return oNtClose(Handle);
-}
-
-//=============================================================================
-// Helper: Check if address is within ntdll.dll or kernel32.dll
-//=============================================================================
-static BOOLEAN IsAddressInSystemDll(_In_ HANDLE ProcessHandle, _In_ PVOID Address)
-{
-    if (!Address)
-        return FALSE;
-
-    __try
-    {
-        MEMORY_BASIC_INFORMATION mbi = {0};
-        SIZE_T returnLen = 0;
-
-        NTSTATUS status =
-            oNtQueryVirtualMemory(ProcessHandle, Address, (MEMORY_INFORMATION_CLASS)0, &mbi, sizeof(mbi), &returnLen); // 0 = MemoryBasicInformation
-
-        if (!NT_SUCCESS(status) || mbi.Type != MEM_IMAGE)
-            return FALSE;
-
-        // Get mapped file name
-        PUNICODE_STRING mappedName = nullptr;
-        status = Misc::Memory::GetMappedFilename(Address, &mappedName);
-
-        if (!NT_SUCCESS(status) || !mappedName)
-            return FALSE;
-
-        SCOPE_EXIT
-        {
-            if (mappedName)
-                Memory::FreePool(mappedName);
-        };
-
-        // Check if it's ntdll.dll or kernel32.dll
-        if (Misc::String::wcsistr(mappedName->Buffer, L"ntdll.dll") ||
-            Misc::String::wcsistr(mappedName->Buffer, L"kernel32.dll") ||
-            Misc::String::wcsistr(mappedName->Buffer, L"kernelbase.dll"))
-        {
-            return TRUE;
-        }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-    }
-
-    return FALSE;
-}
-
-//=============================================================================
-// NtProtectVirtualMemory Hook - Block Roblox from making ntdll/kernel32 writable
-//=============================================================================
-NTSTATUS NTAPI hkNtProtectVirtualMemory(_In_ HANDLE ProcessHandle, _Inout_ PVOID *BaseAddress,
-                                        _Inout_ PSIZE_T RegionSize, _In_ ULONG NewProtection,
-                                        _Out_ PULONG OldProtection)
-{
-    InterlockedIncrement(&g_hooksRefCount);
-    SCOPE_EXIT
-    {
-        InterlockedDecrement(&g_hooksRefCount);
-    };
-
-    const HANDLE currentPid = PsGetCurrentProcessId();
-    const HANDLE targetPid = Misc::GetProcessIDFromProcessHandle(ProcessHandle);
-
-    // Only intercept for Roblox process modifying its own memory
-    if (GetPreviousMode() == UserMode && Processes::IsProcessGame(currentPid) &&
-        (targetPid == currentPid || ProcessHandle == NtCurrentProcess()))
-    {
-        __try
-        {
-            ProbeForWrite(BaseAddress, sizeof(PVOID), 1);
-            ProbeForWrite(RegionSize, sizeof(SIZE_T), 1);
-            ProbeForWrite(OldProtection, sizeof(ULONG), 1);
-
-            PVOID CapturedBase = *BaseAddress;
-            SIZE_T CapturedSize = *RegionSize;
-
-            // Check if they're trying to make system DLL writable (to install hooks)
-            BOOLEAN isMakingWritable = (NewProtection & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE |
-                                                         PAGE_EXECUTE_WRITECOPY)) != 0;
-
-            if (isMakingWritable && IsAddressInSystemDll(ProcessHandle, CapturedBase))
-            {
-                // Get current protection to return as "old"
-                MEMORY_BASIC_INFORMATION mbi = {0};
-                SIZE_T returnLen = 0;
-                oNtQueryVirtualMemory(ProcessHandle, CapturedBase, (MEMORY_INFORMATION_CLASS)0, &mbi, sizeof(mbi),
-                                      &returnLen); // 0 = MemoryBasicInformation
-
-                *OldProtection = mbi.Protect;
-
-                DBG_PRINT("[AntiHook] BLOCKED VirtualProtect on system DLL @ 0x%p (wanted 0x%X)", CapturedBase,
-                          NewProtection);
-
-                // LIE - Say we did it, but we didn't
-                return STATUS_SUCCESS;
-            }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-        }
-    }
-
-    return oNtProtectVirtualMemory(ProcessHandle, BaseAddress, RegionSize, NewProtection, OldProtection);
-}
-
-//=============================================================================
-// NtWriteVirtualMemory Hook - Block Roblox from writing hooks to ntdll/kernel32
-//=============================================================================
-NTSTATUS NTAPI hkNtWriteVirtualMemory(_In_ HANDLE ProcessHandle, _In_opt_ PVOID BaseAddress,
-                                      _In_reads_bytes_(NumberOfBytesToWrite) PVOID Buffer,
-                                      _In_ SIZE_T NumberOfBytesToWrite, _Out_opt_ PSIZE_T NumberOfBytesWritten)
-{
-    InterlockedIncrement(&g_hooksRefCount);
-    SCOPE_EXIT
-    {
-        InterlockedDecrement(&g_hooksRefCount);
-    };
-
-    const HANDLE currentPid = PsGetCurrentProcessId();
-    const HANDLE targetPid = Misc::GetProcessIDFromProcessHandle(ProcessHandle);
-
-    // Only intercept for Roblox process writing to its own memory
-    if (GetPreviousMode() == UserMode && Processes::IsProcessGame(currentPid) &&
-        (targetPid == currentPid || ProcessHandle == NtCurrentProcess()))
-    {
-        // Check if they're trying to write to system DLL (installing hooks)
-        if (IsAddressInSystemDll(ProcessHandle, BaseAddress))
-        {
-            DBG_PRINT("[AntiHook] BLOCKED WriteVirtualMemory to system DLL @ 0x%p size 0x%llX", BaseAddress,
-                      NumberOfBytesToWrite);
-
-            // Store the fake bytes so we can return them when Roblox reads to verify
-            AddFakeWrite(currentPid, BaseAddress, Buffer, NumberOfBytesToWrite);
-
-            // LIE - Say we wrote it, but we didn't
-            __try
-            {
-                if (NumberOfBytesWritten)
-                {
-                    ProbeForWrite(NumberOfBytesWritten, sizeof(SIZE_T), 1);
-                    *NumberOfBytesWritten = NumberOfBytesToWrite;
-                }
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-            }
-
-            return STATUS_SUCCESS;
-        }
-    }
-
-    return oNtWriteVirtualMemory(ProcessHandle, BaseAddress, Buffer, NumberOfBytesToWrite, NumberOfBytesWritten);
 }
 
 BOOLEAN CreateHook(const FNV1A_t ServiceNameHash, PVOID *OriginalRoutine)
@@ -1260,9 +919,6 @@ NTSTATUS Initialize()
 {
     NTSTATUS Status = STATUS_UNSUCCESSFUL;
 
-    // Initialize fake writes tracking for hook spoofing
-    InitFakeWrites();
-
 #define CREATE_HOOK(name)                                                                                              \
     if (!CreateHook(FNV(#name), reinterpret_cast<VOID **>(&o##name)))                                                  \
     {                                                                                                                  \
@@ -1279,8 +935,6 @@ NTSTATUS Initialize()
     CREATE_HOOK(NtQueryInformationProcess);
     CREATE_HOOK(NtSetInformationThread);
     CREATE_HOOK(NtClose);
-    CREATE_HOOK(NtProtectVirtualMemory);
-    CREATE_HOOK(NtWriteVirtualMemory);
 
 #undef CREATE_HOOK
 
